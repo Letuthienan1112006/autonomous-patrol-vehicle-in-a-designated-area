@@ -1,0 +1,1317 @@
+"""
+patrol_robot.py — Vision pipeline cho AGV Patrol Robot
+============================================================
+Đã refactor để dùng Confg.py — tất cả constants từ Confg.
+
+Chạy:
+    Terminal 1: python3 fake_car_socket.py   # hoặc kết nối với STM32
+    Terminal 2: python3 patrol_robot.py
+"""
+
+import socket
+import math
+import cv2
+import numpy as np
+import time
+import json
+import base64
+import torch
+import os
+import threading
+import logging
+from datetime import datetime
+from collections import deque
+
+import requests
+import paho.mqtt.client as mqtt
+from ultralytics import YOLO
+from torchvision import transforms
+from PIL import Image
+
+from model import create_deeplabv3
+
+try:
+    from secrets_local import DISCORD_WEBHOOK_URL
+except ImportError:
+    DISCORD_WEBHOOK_URL = None
+    print("[DISCORD] secrets_local.py khong ton tai - tat canh bao Discord")
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#  IMPORT TẤT CẢ CẤU HÌNH TỪ Confg.py
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+from Confg import (
+    # Network
+    SOCKET_IP, SOCKET_PORT,
+    MQTT_BROKER_IP, MQTT_PORT, MQTT_TOPIC_ALERT, MQTT_TOPIC_STATUS,
+    MQTT_CLIENT_ID,
+    # Model paths
+    SEGMENTATION_MODEL_PATH, PERSON_MODEL_PATH,
+    SEG_INPUT_SIZE, SEG_NORMALIZE_MEAN, SEG_NORMALIZE_STD,
+    SEG_NUM_CLASSES, SEG_BACKBONE, CLASS_COLORS,
+    # Vision
+    PERSON_CONF_THRESHOLD, PERSON_MIN_AREA, PERSON_INFERENCE_SIZE,
+    PERSON_CONFIRM_FRAMES, PERSON_CONFIRM_RATIO, PERSON_CLASS_ID,
+    VEHICLE_CLASS_ID,
+    YOLO_EVERY_N_FRAMES,
+    # Control
+    BASE_SPEED, MIN_SPEED, MAX_STEER, STEER_CENTER_X, STEER_TRIM,
+    RECOVERY_ERROR_THRESHOLD, RECOVERY_SPEED,
+    LANE_LOST_MAX_FRAMES, LANE_LOST_SPEED,
+    PID_KP, PID_KI, PID_KD, PID_MAX_OUTPUT,
+    PID_INTEGRAL_LIMIT, PID_STEP_LIMIT,
+    LANE_ERROR_SMOOTHING_ALPHA,
+    ADAPTIVE_ERROR_NORM, ADAPTIVE_POWER,
+    ADAPTIVE_HEAVY_THRESHOLD, ADAPTIVE_SEVERE_THRESHOLD,
+    SLOPE_BOOST_LIGHT, SLOPE_BOOST_MEDIUM, SLOPE_BOOST_HEAVY,
+    # Navigation
+    PATROL_LOCATIONS, LOCATION_INTERVAL,
+    ARUCO_MIN_AREA, ARUCO_CONFIRM_FRAMES, ARUCO_COMMANDS,
+    STOP_DURATION,
+    INTERSECTION_SCAN_Y, INTERSECTION_DISPLAY_SCAN_Y,
+    HEADING_SCAN_Y_FAR, HEADING_ERROR_WEIGHT,
+    INTERSECTION_SHIFT_THRESHOLD, INTERSECTION_STABLE_FRAMES,
+    INTERSECTION_MAX_FRAMES, INTERSECTION_TIMEOUT_FRAMES,
+    SAFE_DIST_FRAMES_AFTER_SIGN,
+    LANE_STABLE_OFFSET, LANE_STABLE_WIDTH,
+    STABILITY_REQUIRED_FRAMES, STABILITY_CONFIDENCE_THR,
+    STABILITY_AGREEMENT_RATIO,
+    # Alert
+    ALERT_COOLDOWN_SEC, SAVE_ALERT_IMAGE, ALERT_IMAGE_DIR,
+    STATUS_INTERVAL_SEC,
+    # Debug
+    SHOW_DEBUG_WINDOW, DEBUG_HUD_FONT_SCALE, DEBUG_HUD_LINE_HEIGHT,
+    # Helper
+    _get_aruco_dict,
+)
+
+logging.getLogger("ultralytics").setLevel(logging.ERROR)
+torch.backends.cudnn.benchmark = True
+
+
+def recv_json_frame(sock, max_bytes=2_000_000):
+    """Nhan tron ven mot JSON frame tu Bridge."""
+    data = bytearray()
+
+    while len(data) < max_bytes:
+        chunk = sock.recv(65536)
+
+        if not chunk:
+            raise ConnectionError("Bridge da dong ket noi")
+
+        data.extend(chunk)
+
+        try:
+            return json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+    raise RuntimeError(
+        f"JSON frame vuot qua gioi han {max_bytes} bytes"
+    )
+
+
+# ============================================================
+#  KHỞI TẠO ArUco detector (dùng chung)
+# ============================================================
+aruco_dict     = _get_aruco_dict()
+
+# Compatible with both old and new OpenCV ArUco APIs
+if hasattr(cv2.aruco, "DetectorParameters_create"):
+    aruco_params = cv2.aruco.DetectorParameters_create()
+else:
+    aruco_params = cv2.aruco.DetectorParameters()
+
+if hasattr(cv2.aruco, "ArucoDetector"):
+    aruco_detector = cv2.aruco.ArucoDetector(aruco_dict, aruco_params)
+else:
+    aruco_detector = None
+
+
+# ============================================================
+#  MQTT CLIENT
+# ============================================================
+
+def send_discord_alert(image_bytes, persons, location):
+    """Gui canh bao (anh + text) qua Discord webhook. Luon duoc goi
+    tu thread nen (xem send_alert) nen khong chan luong chinh."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        confidence = max(p["confidence"] for p in persons)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        content = (
+            "CANH BAO: phat hien " + summarize_detections(persons) +
+            " tai '" + location + "'\n" +
+            "Tin cay cao nhat: " + format(confidence, ".0%") +
+            " - " + ts
+        )
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL,
+            data={"content": content},
+            files={"file": ("alert.jpg", image_bytes, "image/jpeg")},
+            timeout=5,
+        )
+        if resp.status_code not in (200, 204):
+            print("[DISCORD] Loi gui:", resp.status_code, resp.text[:200])
+    except Exception as error:
+        print("[DISCORD] Loi gui:", error)
+
+
+def send_discord_lift_alert(image_bytes, location, lift_since):
+    """Gui canh bao xe bi nhac len khoi mat dat qua Discord webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        return
+    try:
+        content = (
+            "CANH BAO: XE BI NHAC LEN KHOI MAT DAT!\n"
+            "Vi tri: '" + location + "'\n"
+            "Thoi diem nhac len: " + lift_since
+        )
+        data = {"content": content}
+        files = None
+        if image_bytes is not None:
+            files = {"file": ("lift_alert.jpg", image_bytes, "image/jpeg")}
+        resp = requests.post(
+            DISCORD_WEBHOOK_URL, data=data, files=files, timeout=5,
+        )
+        if resp.status_code not in (200, 204):
+            print(
+                "[DISCORD] Loi gui canh bao nhac len:",
+                resp.status_code, resp.text[:200],
+            )
+    except Exception as error:
+        print("[DISCORD] Loi gui canh bao nhac len:", error)
+
+
+class MQTTClient:
+    def __init__(self):
+        self.client    = mqtt.Client(client_id=MQTT_CLIENT_ID)
+        self.connected = False
+        self.client.on_connect    = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        self._connect()
+
+    def _connect(self):
+        try:
+            if not hasattr(self.client, "connect_async"):
+                print("[MQTT] Khong co connect_async - chay offline")
+                return
+            self.client.connect_async(
+                MQTT_BROKER_IP, MQTT_PORT, keepalive=60
+            )
+            self.client.loop_start()
+            print(f"[MQTT] Dang ket noi nen toi {MQTT_BROKER_IP}:{MQTT_PORT}")
+        except Exception as error:
+            print(f"[MQTT] Khong khoi dong duoc: {error} - chay offline")
+
+    def _on_connect(self, client, userdata, flags, rc):
+        self.connected = (rc == 0)
+        print("[MQTT] Kết nối thành công!" if rc == 0
+              else f"[MQTT] Lỗi kết nối rc={rc}")
+
+    def _on_disconnect(self, client, userdata, rc):
+        self.connected = False
+        print("[MQTT] Mất kết nối, đang thử lại...")
+
+    def publish(self, topic: str, payload: dict) -> bool:
+        if not self.connected:
+            return False
+        try:
+            self.client.publish(topic, json.dumps(payload), qos=1)
+            return True
+        except Exception as e:
+            print(f"[MQTT] Lỗi publish: {e}")
+            return False
+
+    def send_alert(self, frame: np.ndarray, persons: list, location: str):
+        frame_copy = frame.copy()
+        for p in persons:
+            x1, y1, x2, y2 = map(int, p["bbox"])
+            cv2.rectangle(frame_copy, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(frame_copy, f"{p['label']} {p['confidence']:.0%}",
+                        (x1, max(y1 - 8, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+        if SAVE_ALERT_IMAGE:
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(ALERT_IMAGE_DIR, f"alert_{ts}.jpg")
+            cv2.imwrite(path, frame_copy)
+
+        _, buf  = cv2.imencode(".jpg", frame_copy, [cv2.IMWRITE_JPEG_QUALITY, 75])
+        img_b64 = base64.b64encode(buf).decode()
+
+        payload = {
+            "event":      "intruder_detected",
+            "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "location":   location,
+            "count":      len(persons),
+            "confidence": round(max(p["confidence"] for p in persons), 3),
+            "image":      img_b64,
+        }
+        if self.publish(MQTT_TOPIC_ALERT, payload):
+            print(f"[ALERT] Đã gửi: {summarize_detections(persons)} tại '{location}'")
+
+        send_discord_alert(buf.tobytes(), persons, location)
+
+    def send_status(self, data: dict):
+        self.publish(MQTT_TOPIC_STATUS, {
+            "event":     "status",
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            **data,
+        })
+
+    def send_lift_alert(self, location: str, lift_since: str):
+        payload = {
+            "event":      "robot_lifted",
+            "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "location":   location,
+            "lift_since": lift_since,
+        }
+        if self.publish(MQTT_TOPIC_ALERT, payload):
+            print(f"[ALERT] Da gui: XE BI NHAC LEN tai '{location}'")
+
+    def disconnect(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+
+# ============================================================
+#  ARUCO MARKER DETECTION
+# ============================================================
+
+class ArucoCommandFilter:
+    """Lọc nhiễu: chỉ nhận lệnh khi thấy cùng 1 marker N frame liên tiếp."""
+    def __init__(self):
+        self.buffer      = deque(maxlen=ARUCO_CONFIRM_FRAMES)
+        self.last_cmd    = None
+        self.cmd_sent    = False
+        self.missing_cnt = 0
+
+    def update(self, detected_id):
+        self.buffer.append(detected_id)
+
+        if detected_id is None:
+            self.missing_cnt += 1
+            if self.missing_cnt >= ARUCO_CONFIRM_FRAMES:
+                self.cmd_sent    = False
+                self.last_cmd    = None
+                self.missing_cnt = 0
+            return None
+
+        self.missing_cnt = 0
+
+        if len(self.buffer) < ARUCO_CONFIRM_FRAMES:
+            return None
+
+        ids_in_buf = [x for x in self.buffer if x is not None]
+        if len(ids_in_buf) < ARUCO_CONFIRM_FRAMES:
+            return None
+
+        most_common_id = max(set(ids_in_buf), key=ids_in_buf.count)
+        if ids_in_buf.count(most_common_id) < ARUCO_CONFIRM_FRAMES * 0.8:
+            return None
+
+        cmd = ARUCO_COMMANDS.get(most_common_id)
+        if cmd is None:
+            return None
+
+        if self.cmd_sent and self.last_cmd == cmd:
+            return None
+
+        self.cmd_sent = True
+        self.last_cmd = cmd
+        print(f"[ARUCO] Marker ID={most_common_id} → lệnh: {cmd}")
+        return cmd
+
+    @property
+    def is_seeing_marker(self):
+        return any(x is not None for x in self.buffer)
+
+    def reset(self):
+        self.buffer.clear()
+        self.last_cmd    = None
+        self.cmd_sent    = False
+        self.missing_cnt = 0
+
+
+def detect_aruco(frame):
+    """Detect ArUco marker lớn nhất trong frame."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if aruco_detector is not None:
+        corners, ids, _ = aruco_detector.detectMarkers(gray)
+    else:
+        corners, ids, _ = cv2.aruco.detectMarkers(gray, aruco_dict, parameters=aruco_params)
+
+    if ids is None or len(ids) == 0:
+        return None, None
+
+    best_id = None
+    best_area = 0
+    best_corners = None
+
+    for i, corner in enumerate(corners):
+        pts = corner[0]
+        area = cv2.contourArea(pts)
+        if area > best_area and area > ARUCO_MIN_AREA:
+            best_area = area
+            best_id = int(ids[i][0])
+            best_corners = corner
+
+    return best_id, best_corners
+
+
+# ============================================================
+#  PHÁT HIỆN NGƯỜI
+# ============================================================
+
+class IntruderConfirmFilter:
+    def __init__(self):
+        self.buffer        = deque(maxlen=PERSON_CONFIRM_FRAMES)
+        self.last_alert_ts = 0.0
+        self.alert_count   = 0
+
+    def update(self, detected):
+        self.buffer.append(detected)
+        if len(self.buffer) < PERSON_CONFIRM_FRAMES:
+            return False
+        if sum(self.buffer) / PERSON_CONFIRM_FRAMES < PERSON_CONFIRM_RATIO:
+            return False
+        now = time.time()
+        if now - self.last_alert_ts < ALERT_COOLDOWN_SEC:
+            return False
+        self.last_alert_ts = now
+        self.alert_count  += 1
+        return True
+
+    @property
+    def is_detecting(self):
+        return bool(self.buffer) and sum(self.buffer) > 0
+
+
+def detect_persons(yolo_model, frame):
+    """Phat hien nguoi VA xe (COCO person=0, car=2) de canh bao.
+    Ten "detect_persons"/"persons" giu nguyen de khong phai doi ten o
+    nhieu noi khac trong file, nhung tu day co the la nguoi hoac xe -
+    xem field "label" cua tung phan tu tra ve."""
+    results = yolo_model(
+        frame,
+        imgsz=PERSON_INFERENCE_SIZE,
+        conf=PERSON_CONF_THRESHOLD,
+        classes=[PERSON_CLASS_ID, VEHICLE_CLASS_ID],
+        verbose=False,
+        device="cpu",   # Jetson fix: torchvision NMS CUDA not available
+    )
+    persons = []
+    for r in results:
+        if r.boxes is None:
+            continue
+        for box in r.boxes:
+            bbox = box.xyxy[0].cpu().numpy()
+            area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            if area < PERSON_MIN_AREA:
+                continue
+            cls_id = int(box.cls[0])
+            label = "Nguoi" if cls_id == PERSON_CLASS_ID else "Xe"
+            persons.append({
+                "bbox":       bbox,
+                "confidence": float(box.conf[0]),
+                "area":       area,
+                "class_id":   cls_id,
+                "label":      label,
+            })
+    return persons
+
+
+def summarize_detections(persons):
+    """'2 nguoi, 1 xe' tu danh sach detection (co ca nguoi lan xe)."""
+    counts = {}
+    for p in persons:
+        label = p.get("label", "Nguoi")
+        counts[label] = counts.get(label, 0) + 1
+    parts = []
+    if counts.get("Nguoi"):
+        parts.append(f"{counts['Nguoi']} nguoi")
+    if counts.get("Xe"):
+        parts.append(f"{counts['Xe']} xe")
+    return ", ".join(parts) if parts else "0 doi tuong"
+
+
+# ============================================================
+#  PATROL LOCATION TRACKER
+# ============================================================
+
+class PatrolLocationTracker:
+    def __init__(self):
+        self.start_time = time.time()
+
+    @property
+    def current(self):
+        elapsed = time.time() - self.start_time
+        idx = int(elapsed / LOCATION_INTERVAL) % len(PATROL_LOCATIONS)
+        return PATROL_LOCATIONS[idx]
+
+
+# ============================================================
+#  LANE FOLLOWING
+# ============================================================
+
+def decode_segmap(mask):
+    h, w = mask.shape
+    color_mask = np.zeros((h, w, 3), dtype=np.uint8)
+    for class_id, color in CLASS_COLORS.items():
+        color_mask[mask == class_id] = color
+    return color_mask
+
+
+def get_lane_midpoint(mask, y=None):
+    if y is None:
+        y = INTERSECTION_SCAN_Y
+    if y >= mask.shape[0]:
+        y = mask.shape[0] - 1
+
+    # Uu tien dung vach line (class 2) vi chinh xac hon vung road
+    # rong (class 1), fallback ve road khi khong thay line ro.
+    line_indices = np.where(mask[y, :] == 2)[0]
+    if len(line_indices) >= 2:
+        left = line_indices[0]
+        right = line_indices[-1]
+        return left, right, (left + right) // 2
+
+    lane_indices = np.where(mask[y, :] == 1)[0]
+    if len(lane_indices) < 2:
+        return None
+    left = lane_indices[0]
+    right = lane_indices[-1]
+    return left, right, (left + right) // 2
+
+
+def get_heading_error(mask, near_y, near_mx):
+    """Quet them 1 diem o hang xa hon (near_y - HEADING_SCAN_Y_FAR nam
+    phia tren trong anh), noi voi diem gan (near_mx tai near_y) thanh 1
+    duong thang, tra ve do lech GOC (pixel-tuong-duong, da nhan
+    HEADING_ERROR_WEIGHT) so voi phuong thang dung (di thang).
+
+    Duong > 0 nghia la diem xa lech ve BEN PHAI so voi diem gan (huong
+    duong dang re/nghieng phai) - cung dau voi lane_error hien co (mx -
+    center_x duong = lech phai) nen cong truc tiep duoc, khong can doi dau.
+
+    Tra ve 0 neu khong tim thay diem xa (giu nguyen lane_error cu, khong
+    anh huong gi - dung cho ca truong hop mat doan giua vi 2 hang duoc
+    quet doc lap voi nhau)."""
+    far_points = get_lane_midpoint(mask, HEADING_SCAN_Y_FAR)
+    if far_points is None:
+        return 0.0
+    _, _, far_mx = far_points
+
+    dx = float(far_mx - near_mx)
+    dy = float(near_y - HEADING_SCAN_Y_FAR)
+    if dy <= 0:
+        return 0.0
+
+    angle_deg = math.degrees(math.atan2(dx, dy))
+    return angle_deg * HEADING_ERROR_WEIGHT
+
+
+def detect_intersection_points(mask, scan_y=None):
+    if scan_y is None:
+        scan_y = INTERSECTION_SCAN_Y
+    height, width = mask.shape
+    info = {
+        "center_left": None, "center": None, "center_right": None,
+        "left": None, "right": None,
+        "is_intersection": False, "lane_count": 0,
+        "should_turn_left": False, "should_turn_right": False,
+        "left_shift": 0, "right_shift": 0, "confidence": 0.0,
+    }
+    scan_y      = min(scan_y, height - 1)
+    lane_pixels = np.where(mask[scan_y, :] == 1)[0]
+    if len(lane_pixels) < 10:
+        return info
+
+    ll = lane_pixels[0]; lr = lane_pixels[-1]; lw = lr - ll
+
+    scan_points = {
+        "center":       width // 2,
+        "center_left":  ll + lw // 4,
+        "center_right": ll + 3 * lw // 4,
+        "left":         ll,
+        "right":        lr,
+    }
+
+    if not hasattr(detect_intersection_points, "initial_left"):
+        detect_intersection_points.initial_left  = ll
+        detect_intersection_points.initial_right = lr
+
+    for name, x_pos in scan_points.items():
+        if not (0 <= x_pos < width):
+            info[name] = {"detected": False}
+            continue
+        if name in ("left", "right"):
+            info[name] = {
+                "detected": bool(mask[scan_y, x_pos] == 1),
+                "center": x_pos, "start": x_pos, "end": x_pos, "width": 1,
+            }
+        else:
+            x0 = max(0, x_pos - 30)
+            x1 = min(width, x_pos + 30)
+            seg = np.where(mask[scan_y, x0:x1] == 1)[0]
+            if len(seg) > 10:
+                s = seg[0] + x0; e = seg[-1] + x0
+                info[name] = {"detected": True, "start": s, "end": e,
+                              "center": (s + e) // 2, "width": e - s}
+            else:
+                info[name] = {"detected": False}
+
+    detected = sum(1 for v in info.values()
+                   if isinstance(v, dict) and v.get("detected"))
+
+    if info["left"].get("detected"):
+        info["left_shift"]  = (info["left"]["center"]
+                                - detect_intersection_points.initial_left)
+    if info["right"].get("detected"):
+        info["right_shift"] = (info["right"]["center"]
+                                - detect_intersection_points.initial_right)
+
+    thr = INTERSECTION_SHIFT_THRESHOLD * (
+        1.3 if detected >= 4 else 1.1 if detected == 3 else 0.9
+    )
+    ls = abs(info["left_shift"]); rs = abs(info["right_shift"])
+    conf = min(
+        (0.3 if detected >= 3 else 0.0) +
+        (0.4 if max(ls, rs) > thr else 0.0) +
+        (0.3 if detected >= 4 and max(ls, rs) > thr * 1.2 else 0.0),
+        1.0,
+    )
+    info["confidence"]        = conf
+    info["should_turn_left"]  = (info["left_shift"]  >  thr
+                                  and detected >= 3 and conf > 0.6)
+    info["should_turn_right"] = (info["right_shift"] < -thr
+                                  and detected >= 3 and conf > 0.6)
+    info["lane_count"]        = detected
+    info["is_intersection"]   = detected >= 3
+    return info
+
+
+def calculate_intersection_steering(intersection_info, traffic_sign_command):
+    if not intersection_info["is_intersection"]:
+        return None
+    cx = STEER_CENTER_X
+    if not traffic_sign_command:
+        if intersection_info["should_turn_left"]:  return -15
+        if intersection_info["should_turn_right"]: return  15
+        cl = intersection_info.get("center")
+        if cl and cl.get("detected"):
+            return max(-5, min(5, (cl["center"] - cx) * 0.3))
+        return 0
+
+    cl = intersection_info.get("center")
+    if not cl or not cl.get("detected"):
+        return None
+    cur = cl["center"]
+
+    if traffic_sign_command == "turn_left":
+        lft = intersection_info.get("left", {})
+        tx  = (lft["center"] if lft.get("detected")
+               else intersection_info.get("center_left", {}).get("center", cx - 80))
+        return max(-15, min(-5, (tx - cx) * 0.4))
+
+    if traffic_sign_command == "turn_right":
+        rgt = intersection_info.get("right", {})
+        tx  = (rgt["center"] if rgt.get("detected")
+               else intersection_info.get("center_right", {}).get("center", cx + 80))
+        return max(5, min(15, (tx - cx) * 0.4))
+
+    if traffic_sign_command == "straight":
+        return max(-8, min(8, (cur - cx) * 0.25))
+
+    return None
+
+
+# ============================================================
+#  PID & TỐC ĐỘ
+# ============================================================
+
+class PIDController:
+    def __init__(self, kp=None, ki=None, kd=None, max_output=None):
+        self.kp = kp if kp is not None else PID_KP
+        self.ki = ki if ki is not None else PID_KI
+        self.kd = kd if kd is not None else PID_KD
+        self.max_output    = max_output if max_output is not None else PID_MAX_OUTPUT
+        self.integral      = 0.0
+        self.last_error    = 0.0
+        self.last_output   = 0.0
+        self.last_time     = time.time()
+        self.error_history = deque(maxlen=5)
+
+    def compute(self, error):
+        now = time.time()
+        dt  = max(now - self.last_time, 0.001)
+        self.last_time = now
+
+        self.integral = np.clip(
+            self.integral + error * dt,
+            -PID_INTEGRAL_LIMIT, PID_INTEGRAL_LIMIT
+        )
+        derivative    = (error - self.last_error) / dt
+        self.last_error = error
+
+        out = error * self.kp + self.integral * self.ki + derivative * self.kd
+        if abs(out - self.last_output) > PID_STEP_LIMIT:
+            out = self.last_output + PID_STEP_LIMIT * np.sign(out - self.last_output)
+        out = np.clip(out, -self.max_output, self.max_output)
+        self.last_output = out
+        self.error_history.append(error)
+        return int(out)
+
+
+def adaptive_speed_control(error, base_speed=None, min_speed=None):
+    base_speed = base_speed if base_speed is not None else BASE_SPEED
+    min_speed  = min_speed  if min_speed  is not None else MIN_SPEED
+    factor = 1 - (abs(error) / ADAPTIVE_ERROR_NORM) ** ADAPTIVE_POWER
+    if abs(error) > ADAPTIVE_HEAVY_THRESHOLD:  factor *= 0.8
+    if abs(error) > ADAPTIVE_SEVERE_THRESHOLD: factor *= 0.7
+    return int(max(base_speed * factor, min_speed))
+
+
+def detect_steep_slope(lane_error, lane_points, prev_lane_points=None):
+    boost = 1.0
+    if abs(lane_error) > 100:  boost = SLOPE_BOOST_MEDIUM
+    elif abs(lane_error) > 50: boost = SLOPE_BOOST_LIGHT
+    if lane_points and prev_lane_points:
+        try:
+            pl, pr, pm = prev_lane_points
+            cl, cr, cm = lane_points
+            if abs(cm - pm) > 30 or abs((cr - cl) - (pr - pl)) > 20:
+                boost = max(boost, SLOPE_BOOST_HEAVY)
+        except (TypeError, ValueError):
+            pass
+    return boost
+
+
+# ============================================================
+#  LOC MEM LANE_ERROR (EMA) - giam rung giat do nhieu segmentation
+# ============================================================
+
+class ErrorSmoother:
+    """Loc trung binh mu (EMA) cho lane_error truoc khi dua vao PID,
+    giam rung giat khung-sang-khung ma khong lam tre phan ung nhieu
+    nhu loc trung binh cua so cung. ALPHA=1.0 tuong duong khong loc."""
+
+    def __init__(self, alpha=None):
+        self.alpha = alpha if alpha is not None else LANE_ERROR_SMOOTHING_ALPHA
+        self.value = None
+
+    def update(self, new_value):
+        if self.value is None:
+            self.value = new_value
+        else:
+            self.value = self.alpha * new_value + (1 - self.alpha) * self.value
+        return self.value
+
+    def reset(self):
+        self.value = None
+
+
+# ============================================================
+#  BỘ LỌC ỔN ĐỊNH GIAO LỘ
+# ============================================================
+
+class StabilityFilter:
+    def __init__(self, required_frames=None, confidence_threshold=None):
+        self.required_frames = required_frames or STABILITY_REQUIRED_FRAMES
+        self.confidence_threshold = confidence_threshold or STABILITY_CONFIDENCE_THR
+        self.turn_left_buffer  = deque(maxlen=self.required_frames)
+        self.turn_right_buffer = deque(maxlen=self.required_frames)
+        self.confidence_buffer = deque(maxlen=self.required_frames)
+
+    def update(self, should_turn_left, should_turn_right, confidence):
+        self.turn_left_buffer.append(should_turn_left)
+        self.turn_right_buffer.append(should_turn_right)
+        self.confidence_buffer.append(confidence)
+
+    def get_stable_decision(self):
+        if len(self.turn_left_buffer) < self.required_frames:
+            return False, False, 0.0
+        avg_c = sum(self.confidence_buffer) / self.required_frames
+        sl = (sum(self.turn_left_buffer)
+              >= self.required_frames * STABILITY_AGREEMENT_RATIO
+              and avg_c >= self.confidence_threshold)
+        sr = (sum(self.turn_right_buffer)
+              >= self.required_frames * STABILITY_AGREEMENT_RATIO
+              and avg_c >= self.confidence_threshold)
+        return sl, sr, avg_c
+
+    def reset(self):
+        self.turn_left_buffer.clear()
+        self.turn_right_buffer.clear()
+        self.confidence_buffer.clear()
+
+
+SHOW_WINDOW = False  # False khi chạy qua SSH/headless
+
+SHOW_WINDOW = False  # False khi chạy SSH/headless
+RECORD_VIDEO = True  # True để lưu video xem lại
+VIDEO_FPS = 10
+VIDEO_OUTPUT_PATH = "patrol_record_" + time.strftime("%Y%m%d_%H%M%S") + ".avi"
+video_writer = None
+
+def record_frame(frame):
+    global video_writer
+    if not RECORD_VIDEO:
+        return
+
+    if video_writer is None:
+        h, w = frame.shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+        video_writer = cv2.VideoWriter(VIDEO_OUTPUT_PATH, fourcc, VIDEO_FPS, (w, h))
+        print(f"[REC] Recording video to: {VIDEO_OUTPUT_PATH}")
+
+    video_writer.write(frame)
+
+
+# ============================================================
+#  LOAD MODELS
+# ============================================================
+
+print("[INIT] Loading segmentation model...")
+img_transform = transforms.Compose([
+    transforms.Resize(SEG_INPUT_SIZE),
+    transforms.ToTensor(),
+    transforms.Normalize(SEG_NORMALIZE_MEAN, SEG_NORMALIZE_STD),
+])
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+seg_model = None
+seg_use_fp16 = False
+try:
+    seg_model = create_deeplabv3(
+        num_classes=SEG_NUM_CLASSES, backbone=SEG_BACKBONE, pretrained=False
+    ).to(device)
+    ckpt = torch.load(SEGMENTATION_MODEL_PATH, map_location=device)
+    seg_model.load_state_dict(ckpt.get("state_dict", ckpt), strict=False)
+    seg_model.eval()
+    if device.type == "cuda":
+        seg_model = seg_model.half()
+        seg_use_fp16 = True
+    print(f"[INIT] Segmentation OK ({device}, fp16={seg_use_fp16})")
+except FileNotFoundError:
+    print(f"[WARN] Segmentation model not found: {SEGMENTATION_MODEL_PATH}")
+    print("[WARN] Segmentation disabled. YOLO/person detection can still run.")
+    seg_model = None
+except Exception as e:
+    print(f"[WARN] Segmentation load failed: {type(e).__name__}: {e}")
+    print("[WARN] Segmentation disabled. YOLO/person detection can still run.")
+    seg_model = None
+
+print("[INIT] Loading person detection model...")
+person_model = YOLO(PERSON_MODEL_PATH)
+print("[INIT] Person model OK")
+print("[INIT] ArUco detector sẵn sàng")
+
+
+# ============================================================
+#  MAIN LOOP
+# ============================================================
+
+if __name__ == "__main__":
+    car_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    car_socket.connect((SOCKET_IP, SOCKET_PORT))
+    car_socket.settimeout(3.0)
+    print(f"[CAR] Socket xe: {SOCKET_IP}:{SOCKET_PORT}")
+
+    mqtt_client      = MQTTClient()
+    time.sleep(1.5)
+
+    lane_pid         = PIDController()
+    error_smoother   = ErrorSmoother()
+    stability_filter = StabilityFilter()
+    aruco_filter     = ArucoCommandFilter()
+    intruder_filter  = IntruderConfirmFilter()
+    location_tracker = PatrolLocationTracker()
+
+    steer_angle      = 0
+    car_speed        = 0
+    last_midpoint    = None
+    prev_lane_points = None
+    lane_lost_count  = 0
+    frame_count      = 0
+    persons          = []
+    was_lifted       = False
+
+    intersection_mode    = False
+    traffic_sign_command = None
+    sign_detected        = False
+    passed_sign          = False
+    ready_to_turn        = False
+
+    is_stopped      = False
+    stop_start_time = None
+
+    last_status_time = time.time()
+
+    print("[MAIN] Bắt đầu tuần tra. Nhấn Q hoặc ESC để dừng.")
+
+    with torch.no_grad():
+        try:
+            while True:
+                # ── Gửi lệnh & nhận frame ───────────────────
+                perf_now = time.time()
+                perf_interval_ms = (0.0 if "perf_prev_send" not in locals()
+                                    else (perf_now - perf_prev_send) * 1000)
+                perf_prev_send = perf_now
+                perf_t0 = perf_now
+                car_socket.sendall(
+                    bytes(f"{steer_angle + STEER_TRIM} {car_speed}", "utf-8")
+                )
+                recv = recv_json_frame(car_socket)
+                perf_socket_ms = (time.time() - perf_t0) * 1000
+
+                jpg    = base64.b64decode(recv["Img"])
+                bgr    = cv2.imdecode(
+                    np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR
+                )
+                pil_im = Image.fromarray(
+                    cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                )
+                current_location = location_tracker.current
+
+                # ── A0. KIEM TRA BI NHAC LEN (IMU qua Bridge) ────
+                is_lifted_now = bool(recv.get("lifted"))
+                if is_lifted_now and not was_lifted:
+                    was_lifted = True
+                    lift_since = recv.get(
+                        "lift_since",
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    mqtt_client.send_lift_alert(current_location, lift_since)
+                    _, lift_buf = cv2.imencode(
+                        ".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75]
+                    )
+                    threading.Thread(
+                        target=send_discord_lift_alert,
+                        args=(lift_buf.tobytes(), current_location, lift_since),
+                        daemon=True,
+                    ).start()
+                elif not is_lifted_now and was_lifted:
+                    was_lifted = False
+
+                # ── A. PHÁT HIỆN NGƯỜI ──────────────────────
+                # YOLO dang chay CPU (xem detect_persons) nen chi chay
+                # 1/YOLO_EVERY_N_FRAMES khung, va chay o thread rieng de
+                # chong lan (song song) voi segmentation tren GPU o duoi.
+                frame_count += 1
+                run_yolo_this_frame = (frame_count % YOLO_EVERY_N_FRAMES == 0)
+                yolo_thread  = None
+                yolo_result  = {}
+                perf_yolo_t0 = time.time()
+                if run_yolo_this_frame:
+                    def _run_yolo(_bgr=bgr):
+                        yolo_result["persons"] = detect_persons(person_model, _bgr)
+                    yolo_thread = threading.Thread(target=_run_yolo, daemon=True)
+                    yolo_thread.start()
+
+                # ── B. SEGMENTATION (GPU, chay song song voi YOLO) ───
+                if seg_model is not None:
+                    perf_seg_t0 = time.time()
+                    tensor = img_transform(pil_im).unsqueeze(0).to(device)
+                    if seg_use_fp16:
+                        tensor = tensor.half()
+
+                    pred_mask_small = (
+                        torch.argmax(seg_model(tensor), dim=1)
+                        .squeeze(0).cpu().numpy()
+                    )
+
+                    frame_h, frame_w = bgr.shape[:2]
+                    pred_mask = cv2.resize(
+                        pred_mask_small.astype(np.uint8),
+                        (frame_w, frame_h),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    # TAM THOI (2026-09-03): class "motobike" (4) chua du du lieu
+                    # train de nhan dien dung - hay bi nham vach vang/mat duong
+                    # sang mot obike, lam thung/lech bien "road" gay lech huong.
+                    # Gan lai thanh road cho toi khi train lai voi du lieu
+                    # motobike da dang hon. Khong anh huong canh bao xe (dung
+                    # YOLO rieng, khong dung segmentation).
+                    pred_mask[pred_mask == 4] = 1
+                    perf_seg_ms = (time.time() - perf_seg_t0) * 1000
+                else:
+                    # No segmentation model available.
+                    # Use an empty mask so the rest of the program can keep running.
+                    pred_mask = np.zeros((bgr.shape[0], bgr.shape[1]), dtype=np.uint8)
+                    perf_seg_ms = 0.0
+
+                # Gop ket qua YOLO (neu co chay khung nay) truoc khi dung persons.
+                if yolo_thread is not None:
+                    yolo_thread.join()
+                    persons = yolo_result.get("persons", persons)
+                    should_alert = intruder_filter.update(len(persons) > 0)
+                    if should_alert and persons:
+                        threading.Thread(
+                            target=mqtt_client.send_alert,
+                            args=(bgr, persons, current_location),
+                            daemon=True,
+                        ).start()
+                perf_yolo_ms = (time.time() - perf_yolo_t0) * 1000
+
+                perf_subtotal_ms = (time.time() - perf_t0) * 1000
+                print("[STAGE] interval={:.0f}ms socket={:.0f}ms "
+                      "yolo={:.0f}ms(ran={}) seg={:.0f}ms subtotal={:.0f}ms".format(
+                          perf_interval_ms, perf_socket_ms,
+                          perf_yolo_ms, run_yolo_this_frame, perf_seg_ms, perf_subtotal_ms,
+                      ))
+
+                # ── C. ARUCO ─────────────────────────────────
+                marker_id, marker_corners = detect_aruco(bgr)
+                aruco_cmd = aruco_filter.update(marker_id)
+
+                if aruco_cmd == "stop":
+                    is_stopped      = True
+                    stop_start_time = time.time()
+                    car_speed       = 0
+                    steer_angle     = 0
+                    print("[ARUCO] Lệnh STOP — dừng xe")
+                elif aruco_cmd in ("turn_left", "turn_right", "straight"):
+                    traffic_sign_command = aruco_cmd
+                    sign_detected        = True
+                    passed_sign          = False
+                    ready_to_turn        = False
+                    print(f"[ARUCO] Lệnh {aruco_cmd} — chờ đến giao lộ")
+
+                if is_stopped:
+                    if time.time() - stop_start_time >= STOP_DURATION:
+                        is_stopped = False
+                        car_speed  = BASE_SPEED
+                        print("[ARUCO] Hết thời gian STOP — tiếp tục")
+                    else:
+                        if SHOW_DEBUG_WINDOW or RECORD_VIDEO:
+                            display_img = np.array(pil_im.resize((640, 360)))
+                            cv2.putText(display_img, "STOPPED",
+                                        (240, 180), cv2.FONT_HERSHEY_SIMPLEX,
+                                        2, (0, 0, 255), 4)
+                            record_frame(display_img)
+                            if SHOW_WINDOW:
+                                cv2.imshow("Patrol Robot", display_img)
+                            if SHOW_WINDOW and cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                                break
+                        continue
+
+                # ── D. INTERSECTION & LANE ───────────────────
+                intersection_info = detect_intersection_points(pred_mask)
+                intersection_info_display = detect_intersection_points(
+                    pred_mask, scan_y=INTERSECTION_DISPLAY_SCAN_Y
+                )
+                lane_points = get_lane_midpoint(pred_mask)
+                center_x    = STEER_CENTER_X
+
+                if lane_points:
+                    lane_lost_count = 0
+                else:
+                    lane_lost_count += 1
+
+                if not hasattr(detect_intersection_points, "stable_count"):
+                    detect_intersection_points.stable_count = 0
+                if (intersection_info["is_intersection"]
+                        and intersection_info["lane_count"] >= 3):
+                    detect_intersection_points.stable_count += 1
+                else:
+                    detect_intersection_points.stable_count = 0
+                intersection_truly_stable = (
+                    detect_intersection_points.stable_count >= INTERSECTION_STABLE_FRAMES
+                )
+
+                stability_filter.update(
+                    intersection_info.get("should_turn_left", False),
+                    intersection_info.get("should_turn_right", False),
+                    intersection_info.get("confidence", 0.0),
+                )
+                stable_left, stable_right, avg_confidence = (
+                    stability_filter.get_stable_decision()
+                )
+
+                if sign_detected and not aruco_filter.is_seeing_marker:
+                    passed_sign = True
+
+                if passed_sign:
+                    if not hasattr(detect_intersection_points, "frames_since_passed"):
+                        detect_intersection_points.frames_since_passed = 0
+                    detect_intersection_points.frames_since_passed += 1
+                    safe_dist = (
+                        detect_intersection_points.frames_since_passed
+                        >= SAFE_DIST_FRAMES_AFTER_SIGN
+                    )
+                else:
+                    if hasattr(detect_intersection_points, "frames_since_passed"):
+                        detect_intersection_points.frames_since_passed = 0
+                    safe_dist = True
+
+                strong_signal = (
+                    passed_sign
+                    and intersection_info["is_intersection"]
+                    and intersection_info["lane_count"] >= 3
+                    and avg_confidence > 0.8
+                    and (
+                        (stable_left  and traffic_sign_command == "turn_left") or
+                        (stable_right and traffic_sign_command == "turn_right")
+                    )
+                )
+
+                if not ready_to_turn and (
+                    (passed_sign and safe_dist
+                     and intersection_info["is_intersection"]
+                     and intersection_truly_stable
+                     and intersection_info["lane_count"] >= 3
+                     and traffic_sign_command in ("turn_left", "turn_right", "straight"))
+                    or strong_signal
+                ):
+                    ready_to_turn     = True
+                    intersection_mode = True
+                    if not hasattr(detect_intersection_points, "int_frames"):
+                        detect_intersection_points.int_frames = 0
+
+                if intersection_mode and ready_to_turn:
+                    if not hasattr(detect_intersection_points, "int_frames"):
+                        detect_intersection_points.int_frames = 0
+                    detect_intersection_points.int_frames += 1
+                else:
+                    if hasattr(detect_intersection_points, "int_frames"):
+                        detect_intersection_points.int_frames = 0
+
+                # Reset logic
+                reset_needed = False
+
+                if (intersection_mode and ready_to_turn
+                        and not intersection_info["is_intersection"]):
+                    reset_needed = True
+
+                if intersection_mode and ready_to_turn and lane_points:
+                    lx, rx, mx = lane_points
+                    lane_stable = (abs(mx - center_x) < LANE_STABLE_OFFSET
+                                   and rx - lx > LANE_STABLE_WIDTH)
+                    cmd_done = (
+                        (traffic_sign_command == "turn_left"  and mx < center_x - 30) or
+                        (traffic_sign_command == "turn_right" and mx > center_x + 30) or
+                        (traffic_sign_command == "straight")
+                    )
+                    if lane_stable and cmd_done:
+                        reset_needed = True
+
+                if intersection_mode and ready_to_turn:
+                    if (getattr(detect_intersection_points, "int_frames", 0)
+                            > INTERSECTION_MAX_FRAMES):
+                        reset_needed = True
+
+                if (sign_detected or passed_sign or ready_to_turn) and \
+                        not intersection_info["is_intersection"]:
+                    if not hasattr(detect_intersection_points, "frames_after_sign"):
+                        detect_intersection_points.frames_after_sign = 0
+                    detect_intersection_points.frames_after_sign += 1
+                    if (detect_intersection_points.frames_after_sign
+                            > INTERSECTION_TIMEOUT_FRAMES):
+                        reset_needed = True
+                else:
+                    if hasattr(detect_intersection_points, "frames_after_sign"):
+                        detect_intersection_points.frames_after_sign = 0
+
+                if reset_needed:
+                    intersection_mode    = False
+                    traffic_sign_command = None
+                    sign_detected        = False
+                    passed_sign          = False
+                    ready_to_turn        = False
+                    stability_filter.reset()
+                    aruco_filter.reset()
+                    for attr in ("frames_after_sign", "int_frames",
+                                 "frames_since_passed", "stable_count"):
+                        if hasattr(detect_intersection_points, attr):
+                            setattr(detect_intersection_points, attr, 0)
+
+                # ── E. STEERING ──────────────────────────────
+                lane_error = 0
+
+                if (intersection_mode and ready_to_turn
+                        and traffic_sign_command in ("turn_left", "turn_right", "straight")):
+                    steer = calculate_intersection_steering(
+                        intersection_info, traffic_sign_command
+                    )
+                    if steer is not None:
+                        steer_angle = steer
+                        car_speed   = 80
+                    else:
+                        if lane_points:
+                            _, _, mx  = lane_points
+                            last_midpoint = mx
+                            lane_error    = mx - center_x
+                            lane_error   += get_heading_error(
+                                pred_mask, INTERSECTION_SCAN_Y, mx
+                            )
+                        elif last_midpoint is not None:
+                            lane_error = last_midpoint - center_x
+                        slope_boost = detect_steep_slope(
+                            lane_error, lane_points, prev_lane_points
+                        )
+                        lane_error  = error_smoother.update(lane_error)
+                        steer_angle = lane_pid.compute(lane_error)
+                        car_speed   = int(
+                            adaptive_speed_control(lane_error) * slope_boost
+                        )
+                else:
+                    if lane_points:
+                        _, _, mx  = lane_points
+                        last_midpoint = mx
+                        lane_error    = mx - center_x
+                        lane_error   += get_heading_error(
+                            pred_mask, INTERSECTION_SCAN_Y, mx
+                        )
+                    elif last_midpoint is not None:
+                        lane_error = last_midpoint - center_x
+                    slope_boost = detect_steep_slope(
+                        lane_error, lane_points, prev_lane_points
+                    )
+                    lane_error  = error_smoother.update(lane_error)
+                    steer_angle = lane_pid.compute(lane_error)
+                    car_speed   = int(
+                        adaptive_speed_control(lane_error) * slope_boost
+                    )
+
+                # Lech qua nhieu khoi tam lane: giam toc manh de xoay
+                # gap quanh 1 banh thay vi lao tiep (khong doi huong steer,
+                # PID da tu day steer ve gan max khi loi lon).
+                if abs(lane_error) >= RECOVERY_ERROR_THRESHOLD:
+                    car_speed = RECOVERY_SPEED
+
+                # Mat dau lane qua lau (khong con thay road/line khung nao):
+                # dung lai an toan thay vi cu lai mu theo last_midpoint cu.
+                # Ghi de len tat ca cac truong hop tren, ke ca RECOVERY.
+                if lane_lost_count >= LANE_LOST_MAX_FRAMES:
+                    car_speed = LANE_LOST_SPEED
+
+                prev_lane_points = lane_points
+
+                # ── F. HEARTBEAT ─────────────────────────────
+                if time.time() - last_status_time >= STATUS_INTERVAL_SEC:
+                    mqtt_client.send_status({
+                        "location":        current_location,
+                        "speed":           car_speed,
+                        "steer":           steer_angle,
+                        "intruder_active": intruder_filter.is_detecting,
+                        "total_alerts":    intruder_filter.alert_count,
+                        "intersection":    intersection_mode,
+                        "aruco_command":   traffic_sign_command or "none",
+                    })
+                    last_status_time = time.time()
+
+                # ── G. DEBUG WINDOW ──────────────────────────
+                if SHOW_DEBUG_WINDOW or RECORD_VIDEO:
+                    img_resized = np.array(pil_im.resize((640, 360)))
+                    mask_color  = decode_segmap(pred_mask)
+                    display_img = cv2.addWeighted(
+                        img_resized, 0.5, mask_color, 0.5, 0
+                    )
+
+                    for pname, pinfo in intersection_info_display.items():
+                        if isinstance(pinfo, dict) and pinfo.get("detected"):
+                            cx_pt = pinfo["center"]
+                            col = {
+                                "left":         (255, 0,   0),
+                                "center_left":  (255, 255, 0),
+                                "center":       (0,   255, 0),
+                                "center_right": (0,   255, 255),
+                                "right":        (0,   0,   255),
+                            }.get(pname, (255, 255, 255))
+                            cv2.circle(display_img, (cx_pt, 355), 8, col, -1)
+                            cv2.putText(
+                                display_img, pname[0].upper(),
+                                (cx_pt - 5, 340),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2,
+                            )
+
+                    cv2.line(display_img, (0, INTERSECTION_DISPLAY_SCAN_Y),
+                             (640, INTERSECTION_DISPLAY_SCAN_Y), (128, 128, 128), 2)
+                    cv2.line(display_img, (0, INTERSECTION_SCAN_Y),
+                             (640, INTERSECTION_SCAN_Y), (255, 255, 0), 2)
+                    cv2.line(display_img, (center_x, 0), (center_x, 360),
+                             (128, 128, 128), 1)
+
+                    if lane_points:
+                        lx, rx, mx = lane_points
+                        cv2.circle(display_img, (mx, INTERSECTION_SCAN_Y),
+                                   6, (255, 255, 255), -1)
+                        cv2.circle(display_img, (lx, INTERSECTION_SCAN_Y),
+                                   4, (255, 0, 0), -1)
+                        cv2.circle(display_img, (rx, INTERSECTION_SCAN_Y),
+                                   4, (255, 0, 0), -1)
+                        cv2.line(display_img,
+                                 (center_x, INTERSECTION_SCAN_Y),
+                                 (mx, INTERSECTION_SCAN_Y),
+                                 (255, 255, 255), 3)
+                        cv2.putText(
+                            display_img,
+                            f"Err:{mx - center_x} (+heading={int(lane_error)})",
+                            (mx + 8, INTERSECTION_SCAN_Y - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+                        )
+
+                    if marker_corners is not None:
+                        cv2.aruco.drawDetectedMarkers(display_img, [marker_corners])
+                        if marker_id is not None:
+                            cmd_label = ARUCO_COMMANDS.get(marker_id, "?")
+                            pts = marker_corners[0].astype(int)
+                            cv2.putText(
+                                display_img,
+                                f"ID={marker_id} -> {cmd_label}",
+                                (pts[0][0], pts[0][1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                            )
+
+                    for p in persons:
+                        x1, y1, x2, y2 = map(int, p["bbox"])
+                        col = (0, 0, 255) if intruder_filter.is_detecting \
+                              else (0, 165, 255)
+                        cv2.rectangle(display_img, (x1, y1), (x2, y2), col, 2)
+                        cv2.putText(
+                            display_img,
+                            f"{p['label'].upper()} {p['confidence']:.0%}",
+                            (x1, max(y1 - 8, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2,
+                        )
+
+                    hud = [
+                        f"Mode: {'INTERSECTION' if intersection_mode else 'PATROL'}",
+                        f"Speed:{car_speed}  Steer:{steer_angle}",
+                        f"ArUco cmd: {traffic_sign_command or 'none'}",
+                        f"Sign detected:{sign_detected}  Passed:{passed_sign}",
+                        f"Ready to turn:{ready_to_turn}",
+                        f"Location: {current_location}",
+                        f"INTRUDER: {'>>> YES <<<' if intruder_filter.is_detecting else 'clear'}",
+                        f"Alerts: {intruder_filter.alert_count}  "
+                        f"MQTT:{'OK' if mqtt_client.connected else 'OFFLINE'}",
+                        f"Lane count: {intersection_info.get('lane_count', 0)}",
+                    ]
+                    for i, line in enumerate(hud):
+                        col = (0, 0, 255) if "YES" in line else (0, 255, 255)
+                        cv2.putText(
+                            display_img, line,
+                            (10, 20 + i * DEBUG_HUD_LINE_HEIGHT),
+                            cv2.FONT_HERSHEY_SIMPLEX, DEBUG_HUD_FONT_SCALE, col, 2,
+                        )
+
+                    record_frame(display_img)
+                    if SHOW_WINDOW:
+                        cv2.imshow("Patrol Robot", display_img)
+                    key = (cv2.waitKey(1) & 0xFF) if SHOW_WINDOW else 255
+                    if key in (ord("q"), 27):
+                        break
+
+        except KeyboardInterrupt:
+            print("\n[MAIN] Dừng...")
+        finally:
+            if video_writer is not None:
+                video_writer.release()
+                print(f"[REC] Video saved: {VIDEO_OUTPUT_PATH}")
+            if SHOW_WINDOW:
+                cv2.destroyAllWindows()
+            mqtt_client.disconnect()
+            car_socket.close()
+            print("[MAIN] Đã đóng tất cả kết nối.")

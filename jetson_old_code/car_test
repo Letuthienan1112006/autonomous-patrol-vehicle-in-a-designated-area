@@ -1,0 +1,977 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import cv2
+import time
+import numpy as np
+from collections import deque
+from rknn.api import RKNN          # <--- dùng RKNN
+from utils import preprocess, postprocess, gen_color, vis_result
+from control import control, close_serial
+
+# ✨ IMU + xử lý cầu
+from bno055_uart import BNO055Compass, BridgeProcessor
+
+# ================= CẤU HÌNH MODEL & LỚP =================
+RKNN_PATH   = '/home/orangepi/CDS_UTE_2025/best_9_class.rknn'
+INPUT_W     = 320
+INPUT_H     = 320
+
+CONF_THRES  = 0.10
+IOU_THRES   = 0.45
+
+CONF_THRES_ROAD = 0.15
+CONF_SIGN       = 0.90
+
+CLASSES = [
+    "brige",        # 0 - biển cầu
+    "go_straight",  # 1
+    "no_left",      # 2
+    "no_right",     # 3
+    "no_straight",  # 4
+    "road",         # 5
+    "stop_sign",    # 6
+    "traffic_light",# 7
+    "turn_left",    # 8
+    "turn_right"    # 9
+]
+
+ROAD_CLASS_NAME    = 'road'
+BRIDGE_LABEL_NAME  = 'brige'   # tên class cầu trong model
+
+# ================== THAM SỐ BÁM LANE & PID ==================
+PATH_TOP_RATIO    = 0.1
+PATH_BOTTOM_RATIO = 0.6
+PATH_ROW_STEP     = 3
+
+KP = 0.25     #(0,25)
+KI = 0.025   #(0.0005)
+KD = 0.030
+MAX_ANGLE = 30
+
+BASE_SPEED      = 25
+MIN_SPEED       = 20
+ERROR_NORM_PIX  = 80
+
+MAX_LOST_FRAMES = 8   # chỉ để log
+
+CURV_THRESH_1       = 20.0
+CURV_THRESH_2       = 40.0
+CURV_ERROR_BOOST_1  = 1.2
+CURV_ERROR_BOOST_2  = 1.4
+
+# ================== BIỂN BÁO ==================
+SIGN_HOLD_FRAMES = 15
+TURN_BIAS_PIX    = 40
+NO_TURN_TOL      = 20
+
+# Lọc biển báo
+MIN_SIGN_AREA   = 25 * 25
+SIGN_ROI_Y_MIN  = 0.30
+SIGN_ROI_Y_MAX  = 0.80
+SIGN_ROI_X_MIN  = 0.35
+SIGN_ROI_X_MAX  = 0.65
+
+# ================== GHI VIDEO ==================
+SAVE_VIDEO = True
+VIDEO_DIR  = '/home/orangepi/CDS_UTE_2025/log_videos'
+VIDEO_FPS  = 20.0
+
+# ================== STATE RECOVERY (CHỈ LÙI) ==================
+MODE_FORWARD    = 0   # chạy PID bình thường
+MODE_RECOV_BACK = 1   # lùi để lấy góc
+
+RECOV_LOST_FRAMES_TRIGGER = 2
+RECOV_REVERSE_SPEED  = -12    # tốc độ lùi
+
+# ================== HÌNH THANG ROI ==================
+TRAP_TOP_Y_RATIO        = 0.25
+TRAP_BOTTOM_Y_RATIO     = 0.95
+TRAP_TOP_WIDTH_RATIO    = 0.35
+TRAP_BOTTOM_WIDTH_RATIO = 1.00
+
+# (để sẵn)
+BRIDGE_PREP_DOWN_COEFF = 0.7
+
+# ================== BRIDGE LOGIC v2 (theo đúng setup biển của bạn) ==================
+# brige1: trước đầu dốc -> ARM
+# brige2: giữa cầu (đoạn bằng) -> MID sign
+
+# TOP slow only after MID sign + IMU=TOP
+BRIDGE_TOP_SLOW_COEFF         = 0.65
+
+# DOWN slow (ưu tiên sau MID sign, có fallback nếu miss)
+BRIDGE_DOWN_SLOW_COEFF        = 0.15
+
+# Giảm góc lái khi đang xuống cầu
+BRIDGE_DOWN_ANGLE_COEFF = 0.6       # 0.5–0.8: nhỏ hơn -> mượt hơn
+BRIDGE_DOWN_MAX_ANGLE   = 18        # giới hạn góc tối đa khi DOWN
+
+
+# Stop braking policy on DOWN
+BRIDGE_DOWN_STOP_HOLD_FR      = 10     # số frame giữ phanh
+BRIDGE_DOWN_STOP1_AT_FR       = 8      # stop giữa dốc theo frame DOWN
+
+BRIDGE_DOWN_END_PITCH_DEG     = 3.0    # stop gần cuối khi pitch ~ 0
+BRIDGE_DOWN_MIN_FR_BEFORE_END = 12     # tránh stop quá sớm
+
+# Fallback: nếu miss brige2 nhưng IMU đã vào DOWN vài frame -> vẫn cho phép DOWN policy
+BRIDGE_DOWN_FALLBACK_FR       = 3
+
+# ================== TURN FORCE at JUNCTION ==================
+TURN_FORCE_ENABLE = True
+TURN_FORCE_MIN_SEGMENTS = 2
+TURN_FORCE_ROW_RATIO = 0.55
+TURN_FORCE_MIN_RUN = 8
+TURN_FORCE_GAP = 4
+
+# ================== HÀM PHỤ LANE ==================
+def compute_path_center(mask, top_ratio=PATH_TOP_RATIO, bottom_ratio=PATH_BOTTOM_RATIO,
+                        step=PATH_ROW_STEP, min_total_pixels=200):
+    h, w = mask.shape
+    y0 = int(h * top_ratio)
+    y1 = int(h * bottom_ratio)
+    if y1 <= y0:
+        y1 = y0 + 1
+
+    rows = []
+    total_pixels = 0
+
+    for y in range(y0, y1, step):
+        row = mask[y, :]
+        xs = np.where(row > 0)[0]
+        if xs.size < 5:
+            continue
+
+        left = int(xs[0])
+        right = int(xs[-1])
+        cx_row = 0.5 * (left + right)
+
+        rows.append((y, cx_row))
+        total_pixels += xs.size
+
+    if len(rows) == 0 or total_pixels < min_total_pixels:
+        return None, None, None
+
+    rows.sort(key=lambda r: r[0])
+    far_cx  = rows[0][1]
+    near_cx = rows[-1][1]
+
+    path_cx = 0.3 * far_cx + 0.7 * near_cx
+    return float(path_cx), float(near_cx), float(far_cx)
+
+def get_left_right_lane_strength(mask, cx):
+    h, w = mask.shape
+    cx = int(np.clip(cx, 0, w - 1))
+    left_area = int(mask[:, :cx].sum())
+    right_area = int(mask[:, cx:].sum())
+    return left_area, right_area
+
+def get_lane_from_road_boxes(road_boxes, img_width):
+    if not road_boxes:
+        return None
+    best_box = max(road_boxes, key=lambda b: b[3])
+    x1, y1, x2, y2, conf, cls_id = best_box
+    mid = float((x1 + x2) / 2.0)
+    return mid
+
+def keep_largest_lane(mask, min_area=300):
+    if mask is None:
+        return mask
+
+    m = (mask > 0).astype(np.uint8)
+    if m.max() == 0:
+        return m
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num_labels <= 1:
+        return m
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    max_idx_relative = int(np.argmax(areas))
+    max_area = areas[max_idx_relative]
+
+    if max_area < min_area:
+        return np.zeros_like(mask, dtype=np.uint8)
+
+    max_idx = 1 + max_idx_relative
+    largest_mask = np.zeros_like(mask, dtype=np.uint8)
+    largest_mask[labels == max_idx] = 1
+    return largest_mask
+
+def smooth_lane_edges(mask, erode_iter=1, dilate_iter=1, kernel_size=3):
+    if mask is None:
+        return mask
+    if mask.max() == 0:
+        return mask
+
+    m = (mask > 0).astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    if erode_iter > 0:
+        m = cv2.erode(m, kernel, iterations=erode_iter)
+    if dilate_iter > 0:
+        m = cv2.dilate(m, kernel, iterations=dilate_iter)
+
+    out = (m > 0).astype(np.uint8)
+    return out
+
+def apply_trapezoid_roi(mask,
+                        top_y_ratio=TRAP_TOP_Y_RATIO,
+                        bottom_y_ratio=TRAP_BOTTOM_Y_RATIO,
+                        top_width_ratio=TRAP_TOP_WIDTH_RATIO,
+                        bottom_width_ratio=TRAP_BOTTOM_WIDTH_RATIO):
+    if mask is None:
+        return mask
+    if mask.max() == 0:
+        return mask
+
+    h, w = mask.shape
+    y_top = int(h * top_y_ratio)
+    y_bottom = int(h * bottom_y_ratio)
+    if y_bottom <= y_top:
+        y_bottom = y_top + 1
+
+    cx = w // 2
+    half_top = int((w * top_width_ratio) / 2.0)
+    half_bottom = int((w * bottom_width_ratio) / 2.0)
+
+    x_left_top     = int(np.clip(cx - half_top, 0, w-1))
+    x_right_top    = int(np.clip(cx + half_top, 0, w-1))
+    x_left_bottom  = int(np.clip(cx - half_bottom, 0, w-1))
+    x_right_bottom = int(np.clip(cx + half_bottom, 0, w-1))
+
+    pts = np.array([
+        [x_left_bottom,  y_bottom],
+        [x_right_bottom, y_bottom],
+        [x_right_top,    y_top],
+        [x_left_top,     y_top],
+    ], dtype=np.int32)
+
+    roi = np.zeros_like(mask, dtype=np.uint8)
+    cv2.fillPoly(roi, [pts], 1)
+
+    masked = mask * roi
+    return masked
+
+# ================== TURN FORCE HELPERS ==================
+def extract_row_segments(mask, y, min_run=8, gap_thresh=4):
+    h, w = mask.shape
+    y = int(np.clip(y, 0, h - 1))
+    row = mask[y, :]
+    xs = np.where(row > 0)[0]
+    if xs.size == 0:
+        return []
+
+    split_idx = np.where(np.diff(xs) > gap_thresh)[0]
+    groups = []
+    start = 0
+    for s in split_idx:
+        groups.append(xs[start:s+1])
+        start = s + 1
+    groups.append(xs[start:])
+
+    segs = []
+    for g in groups:
+        if g.size < min_run:
+            continue
+        left = int(g[0])
+        right = int(g[-1])
+        width = right - left + 1
+        cx = 0.5 * (left + right)
+        segs.append((left, right, cx, width))
+
+    segs.sort(key=lambda t: t[2])
+    return segs
+
+def pick_branch_cx_by_sign(lane_mask_raw, sign_label, cx_img,
+                           row_ratio=0.55, min_segments=2,
+                           min_run=8, gap_thresh=4):
+    if sign_label not in ("turn_left", "turn_right", "go_straight"):
+        return None
+
+    h, w = lane_mask_raw.shape
+    y = int(h * row_ratio)
+
+    segs = extract_row_segments(lane_mask_raw, y, min_run=min_run, gap_thresh=gap_thresh)
+    if len(segs) < min_segments:
+        return None
+
+    if sign_label == "turn_left":
+        return float(segs[0][2])
+
+    if sign_label == "turn_right":
+        return float(segs[-1][2])
+
+    best = min(segs, key=lambda s: abs(s[2] - cx_img))
+    return float(best[2])
+
+# ================== PID & TỐC ĐỘ ==================
+class PIDController:
+    def __init__(self, kp, ki, kd, max_output=25):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.max_output = max_output
+        self.integral = 0.0
+        self.last_error = 0.0
+        self.last_time = time.time()
+
+    def reset(self):
+        self.integral = 0.0
+        self.last_error = 0.0
+        self.last_time = time.time()
+
+    def compute(self, error):
+        now = time.time()
+        dt = now - self.last_time
+        self.last_time = now
+        if dt < 1e-3:
+            dt = 1e-3
+
+        e = float(error)
+
+        p = self.kp * e
+        self.integral += e * dt
+        self.integral = max(min(self.integral, 8.0), -8.0)
+        i = self.ki * self.integral
+
+        de = (e - self.last_error) / dt
+        self.last_error = e
+        d = self.kd * de
+
+        out = p + i + d
+        out = max(min(out, self.max_output), -self.max_output)
+        return float(out)
+
+def adaptive_speed_control(error_px, base_speed=BASE_SPEED, min_speed=MIN_SPEED):
+    e = abs(float(error_px))
+    x = min(e / ERROR_NORM_PIX, 1.5)
+    factor = 1.0 - x ** 1.6
+    speed = base_speed * max(factor, 0.0)
+    if speed < min_speed:
+        speed = min_speed
+    return int(speed)
+
+# ================== TRẠNG THÁI BIỂN BÁO ==================
+class SignState:
+    def __init__(self, hold_frames=SIGN_HOLD_FRAMES,
+                 history_len=15, min_stable=4,
+                 stable_frac_accept=0.7, stable_frac_switch=0.85):
+        self.label = None
+        self.frames_left = 0
+        self.hold_frames = hold_frames
+
+        self.history = deque(maxlen=history_len)
+        self.min_stable = min_stable
+        self.stable_frac_accept = stable_frac_accept
+        self.stable_frac_switch = stable_frac_switch
+
+    def step(self):
+        if self.frames_left > 0:
+            self.frames_left -= 1
+            if self.frames_left == 0:
+                self.label = None
+
+    def update_from_dets(self, det_labels, det_confs):
+        VALID_SIGNS = (
+            'go_straight',
+            'turn_left',
+            'turn_right',
+            'no_left',
+            'no_right',
+            'no_straight',
+            'stop_sign',
+        )
+
+        best_label = None
+        best_conf = 0.0
+        for lab, cf in zip(det_labels, det_confs):
+            if lab not in VALID_SIGNS:
+                continue
+            if cf > best_conf:
+                best_conf = cf
+                best_label = lab
+
+        self.history.append(best_label)
+
+        counts = {}
+        total_non_none = 0
+        for lab in self.history:
+            if lab is None:
+                continue
+            counts[lab] = counts.get(lab, 0) + 1
+            total_non_none += 1
+
+        if total_non_none < self.min_stable or not counts:
+            return
+
+        stable_label = max(counts, key=counts.get)
+        stable_count = counts[stable_label]
+        stable_frac = stable_count / float(total_non_none)
+
+        if stable_frac < self.stable_frac_accept:
+            return
+
+        if self.label is None or stable_label == self.label:
+            self.label = stable_label
+            self.frames_left = self.hold_frames
+        else:
+            if stable_frac >= self.stable_frac_switch:
+                self.label = stable_label
+                self.frames_left = self.hold_frames
+
+    def current(self):
+        return self.label
+
+def apply_sign_logic(error_px, lane_mask, sign_label, cx):
+    # Bias mềm. Junction force sẽ override path_cx trong main.
+    if sign_label is None:
+        return float(error_px)
+
+    e = float(error_px)
+
+    if sign_label == 'go_straight':
+        e *= 0.5
+        return e
+
+    if sign_label == 'turn_left':
+        e -= TURN_BIAS_PIX
+        return e
+
+    if sign_label == 'turn_right':
+        e += TURN_BIAS_PIX
+        return e
+
+    if sign_label == 'no_left':
+        if e < -NO_TURN_TOL:
+            e = max(e, 0.0)
+        return e
+
+    if sign_label == 'no_right':
+        if e > NO_TURN_TOL:
+            e = min(e, 0.0)
+        return e
+
+    if sign_label == 'no_straight':
+        left_area, right_area = get_left_right_lane_strength(lane_mask, cx)
+        if left_area > right_area * 1.1:
+            e -= TURN_BIAS_PIX
+        elif right_area > left_area * 1.1:
+            e += TURN_BIAS_PIX
+        else:
+            e -= TURN_BIAS_PIX * 0.7
+        return e
+
+    return e
+
+# ================== MAIN ==================
+def main():
+    print('RKNN YOLOv8-Seg: PID + RECOVERY + IMU-Bridge(v2 refined) + TURN-FORCE...')
+
+    rknn = RKNN()
+
+    print('Đang load RKNN...')
+    ret = rknn.load_rknn(RKNN_PATH)
+    if ret != 0:
+        print(f'❌ Load RKNN thất bại, code = {ret}')
+        return
+
+    print('Đang init_runtime...')
+    ret = rknn.init_runtime(target='rk3588')
+    if ret != 0:
+        print(f'❌ init_runtime thất bại, code = {ret}')
+        return
+    print('✅ RKNN đã sẵn sàng.')
+
+    print('Khởi tạo camera...')
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print('❌ Không mở được camera.')
+        rknn.release()
+        return
+
+    # --------- KHỞI TẠO IMU + BRIDGE PROCESSOR ---------
+    imu = BNO055Compass()
+    bridge_proc = BridgeProcessor()
+
+    bridge_armed = False           # ARM khi thấy brige1
+    bridge_seen_count = 0
+    last_bridge_frame = -9999
+
+    bridge_state_name = "NORMAL"
+    prev_bridge_state_name = "NORMAL"
+    bridge_speed_coeff = 1.0
+    pitch_raw = 0.0
+    pitch_filtered = 0.0
+
+    # ===== BRIDGE v2 flags =====
+    bridge2_seen = False   # MID-bridge sign seen (biển giữa cầu)
+    top_slow_active = False
+
+    # ===== DOWN stop control =====
+    down_frames = 0
+    down_stop_frames_left = 0
+    down_stop1_done = False
+    down_stop2_done = False
+
+    writer = None
+    video_path = None
+    if SAVE_VIDEO:
+        os.makedirs(VIDEO_DIR, exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        video_path = os.path.join(VIDEO_DIR, f'drive_{ts}.avi')
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        writer = cv2.VideoWriter(video_path, fourcc, VIDEO_FPS,
+                                 (INPUT_W * 3, INPUT_H))
+        if writer.isOpened():
+            print('Đang ghi video vào:', video_path)
+        else:
+            print('Không mở được VideoWriter, sẽ không ghi video.')
+            writer = None
+
+    pid = PIDController(KP, KI, KD, MAX_ANGLE)
+    sign_state = SignState()
+    colorlist = gen_color(len(CLASSES))
+
+    fps_hist = deque(maxlen=50)
+    frame_count = 0
+
+    last_mid = INPUT_W // 2
+    lost_frames = 0
+
+    prev_boxes = None
+    prev_masks = None
+    prev_shape_hw = None
+    MAX_DET_HOLD = 5
+    det_hold_count = 0
+
+    mode = MODE_FORWARD
+    angle_history = deque(maxlen=20)
+    last_good_angle_cmd = 0.0
+    base_turn_angle = 0.0
+
+    speed_cmd = 0
+    angle_cmd = 0.0
+
+    try:
+        while True:
+            t0 = time.perf_counter()
+
+            ret, frame = cap.read()
+            if not ret:
+                print('Mất frame camera.')
+                break
+
+            # --- ĐỌC IMU ---
+            prev_bridge_state_name = bridge_state_name
+            euler = imu.get_euler_angles()
+            if euler:
+                _, _, pitch_raw = euler
+                imu_ctrl = bridge_proc.update(pitch_raw)
+
+                bridge_state_name  = imu_ctrl.get("state", "NORMAL")
+                pitch_filtered     = imu_ctrl.get("pitch_filtered", 0.0)
+                bridge_speed_coeff = imu_ctrl.get("speed_coeff", 1.0)
+            else:
+                bridge_state_name  = "NORMAL"
+                pitch_filtered     = 0.0
+                bridge_speed_coeff = 1.0
+
+            # ===== DOWN frame counter + reset =====
+            if bridge_state_name != "DOWN":
+                down_frames = 0
+                down_stop_frames_left = 0
+                down_stop1_done = False
+                down_stop2_done = False
+            else:
+                down_frames += 1
+
+            # ===== Hết cầu =====
+            if prev_bridge_state_name == "DOWN" and bridge_state_name == "NORMAL":
+                if bridge_armed:
+                    print("[BRIDGE-IMU] Kết thúc cầu -> unarm bridge")
+
+                bridge_armed = False
+                bridge_seen_count = 0
+
+                bridge2_seen = False
+                top_slow_active = False
+
+                down_frames = 0
+                down_stop_frames_left = 0
+                down_stop1_done = False
+                down_stop2_done = False
+
+            # --- PREPROCESS ---
+            img0 = frame.copy()
+            img4, img3 = preprocess(img0, INPUT_H, INPUT_W)
+            img_in = img3.astype(np.uint8)
+
+            # --- INFERENCE ---
+            outputs = None
+            try:
+                outputs = rknn.inference(inputs=[img_in], data_format='nhwc')
+            except KeyboardInterrupt:
+                print("[ERROR] KeyboardInterrupt trong inference -> gửi (0, 0)")
+                control(0, 0)
+                break
+            except Exception as e:
+                print(f"[ERROR] {e} -> gửi (0, 0)")
+                control(0, 0)
+                continue
+
+            if outputs is None:
+                print("[ERROR] inference trả về None -> gửi (0, 0)")
+                control(0, 0)
+                continue
+
+            results_list = postprocess(
+                outputs,
+                img4,
+                img3,
+                CONF_THRES,
+                IOU_THRES,
+                classes=len(CLASSES),
+            )
+            boxes, masks, shape_hw = results_list[0]
+
+            has_det_now = isinstance(boxes, np.ndarray) and boxes.size > 0 and \
+                          isinstance(masks, np.ndarray) and masks.size > 0
+
+            if has_det_now:
+                prev_boxes = boxes
+                prev_masks = masks
+                prev_shape_hw = shape_hw
+                det_hold_count = 0
+            else:
+                if prev_boxes is not None and det_hold_count < MAX_DET_HOLD:
+                    print("[DET-HOLD] dùng lại boxes/masks từ frame trước")
+                    boxes = prev_boxes
+                    masks = prev_masks
+                    shape_hw = prev_shape_hw
+                    det_hold_count += 1
+                else:
+                    prev_boxes = None
+                    prev_masks = None
+                    prev_shape_hw = None
+                    det_hold_count = 0
+
+            if isinstance(shape_hw, (tuple, list)) and len(shape_hw) == 2:
+                H, W = shape_hw
+            else:
+                H, W = INPUT_H, INPUT_W
+
+            lane_mask = np.zeros((H, W), dtype=np.uint8)
+            sign_labels = []
+            sign_confs = []
+            road_boxes = []
+
+            bridge_detected = False
+
+            # --- PARSE DETS ---
+            if isinstance(boxes, np.ndarray) and boxes.size > 0 and \
+               isinstance(masks, np.ndarray) and masks.size > 0:
+                for box, mask in zip(boxes, masks):
+                    cls_id = int(box[5])
+                    conf = float(box[4])
+                    if cls_id < 0 or cls_id >= len(CLASSES):
+                        continue
+                    name = CLASSES[cls_id]
+
+                    x1, y1, x2, y2 = box[:4]
+                    w_box = max(x2 - x1, 0.0)
+                    h_box = max(y2 - y1, 0.0)
+                    area = w_box * h_box
+                    cx_box = (x1 + x2) / 2.0
+                    cy_box = (y1 + y2) / 2.0
+
+                    if name == ROAD_CLASS_NAME:
+                        if conf < CONF_THRES_ROAD:
+                            continue
+                        lane_mask |= (mask > 0).astype(np.uint8)
+                        road_boxes.append(box)
+
+                    elif name == BRIDGE_LABEL_NAME:
+                        if conf < CONF_SIGN:
+                            continue
+                        if area < MIN_SIGN_AREA:
+                            continue
+                        bridge_detected = True
+
+                    else:
+                        if conf < CONF_SIGN:
+                            continue
+                        if area < MIN_SIGN_AREA:
+                            continue
+                        cx_norm = cx_box / float(W)
+                        cy_norm = cy_box / float(H)
+                        if cx_norm < SIGN_ROI_X_MIN or cx_norm > SIGN_ROI_X_MAX:
+                            continue
+                        if cy_norm < SIGN_ROI_Y_MIN or cy_norm > SIGN_ROI_Y_MAX:
+                            continue
+                        sign_labels.append(name)
+                        sign_confs.append(conf)
+
+            # --- SIGN STATE ---
+            sign_state.step()
+            sign_state.update_from_dets(sign_labels, sign_confs)
+            cur_sign = sign_state.current()
+
+            # --- BRIDGE SIGN COUNT ---
+            if bridge_detected:
+                print(f"[BRIDGE] detected at frame={frame_count}, armed={bridge_armed}")
+                if frame_count - last_bridge_frame > 30:
+                    last_bridge_frame = frame_count
+
+                    if not bridge_armed:
+                        bridge_armed = True
+                        bridge_seen_count = 1
+                        print("[BRIDGE] brige1 -> ARM")
+                    else:
+                        bridge_seen_count += 1
+                        print(f"[BRIDGE] brige again, count={bridge_seen_count}")
+
+                    if bridge_seen_count >= 2:
+                        bridge2_seen = True
+                        print("[BRIDGE] MID sign detected (brige2) -> allow TOP slow + prefer DOWN policy")
+
+            # --- TOP slow activation ---
+            if bridge_armed and bridge2_seen and bridge_state_name == "TOP":
+                if not top_slow_active:
+                    print("[BRIDGE] IMU=TOP & MID sign -> TOP slow ACTIVE")
+                top_slow_active = True
+
+            print(f"[BRIDGE-STATE] state={bridge_state_name}, armed={bridge_armed}, "
+                  f"seen={bridge_seen_count}, mid={int(bridge2_seen)}, topSlow={int(top_slow_active)}, "
+                  f"pitch_raw={pitch_raw:.1f}° filt={pitch_filtered:.1f}° "
+                  f"coeff(IMU)={bridge_speed_coeff:.2f} down_frames={down_frames} "
+                  f"stop_left={down_stop_frames_left}")
+
+            # ================== LỌC LANE (2 BẢN) ==================
+            # RAW: giữ nhiều nhánh để ép rẽ ở junction
+            lane_mask_raw = lane_mask.copy()
+            lane_mask_raw = smooth_lane_edges(lane_mask_raw, erode_iter=1, dilate_iter=1, kernel_size=3)
+            lane_mask_raw = apply_trapezoid_roi(lane_mask_raw)
+
+            # MAIN: giữ nhánh lớn nhất để bám lane ổn định
+            lane_mask = keep_largest_lane(lane_mask, min_area=300)
+            lane_mask = smooth_lane_edges(lane_mask, erode_iter=1, dilate_iter=1, kernel_size=3)
+            lane_mask = apply_trapezoid_roi(lane_mask)
+
+            lane_sum = int(lane_mask.sum())
+            h_mask, w_mask = lane_mask.shape
+            cx = w_mask // 2
+
+            path_cx = near_cx = far_cx = None
+            if lane_sum > 0:
+                path_cx, near_cx, far_cx = compute_path_center(lane_mask)
+
+            if path_cx is None and road_boxes:
+                mid_box = get_lane_from_road_boxes(road_boxes, w_mask)
+                if mid_box is not None:
+                    path_cx = mid_box
+                    near_cx = mid_box
+                    far_cx  = mid_box
+
+            # ===== TURN FORCE ở junction =====
+            if TURN_FORCE_ENABLE and lane_mask_raw is not None:
+                if int(lane_mask_raw.sum()) > 0:
+                    forced_cx = pick_branch_cx_by_sign(
+                        lane_mask_raw,
+                        cur_sign,
+                        cx,
+                        row_ratio=TURN_FORCE_ROW_RATIO,
+                        min_segments=TURN_FORCE_MIN_SEGMENTS,
+                        min_run=TURN_FORCE_MIN_RUN,
+                        gap_thresh=TURN_FORCE_GAP
+                    )
+                    if forced_cx is not None:
+                        path_cx = forced_cx
+                        near_cx = forced_cx
+                        far_cx  = forced_cx
+                        print(f"[TURN-FORCE] sign={cur_sign} -> forced path_cx={forced_cx:.1f}")
+
+            curvature = 0.0
+            if far_cx is not None and near_cx is not None:
+                curvature = abs(far_cx - near_cx)
+
+            lane_found = (path_cx is not None)
+
+            # ================= LOGIC LÁI =================
+            if lane_found:
+                if mode != MODE_FORWARD:
+                    pid.reset()
+                    mode = MODE_FORWARD
+                lost_frames = 0
+
+                error_px = path_cx - cx
+                base_speed_eff = BASE_SPEED
+
+                if curvature > CURV_THRESH_2:
+                    if not (bridge_armed and bridge_state_name == "DOWN"):
+                        error_px *= CURV_ERROR_BOOST_2
+                    base_speed_eff = BASE_SPEED - 8
+                elif curvature > CURV_THRESH_1:
+                    if not (bridge_armed and bridge_state_name == "DOWN"):
+                     error_px *= CURV_ERROR_BOOST_1
+                    base_speed_eff = BASE_SPEED - 4
+
+                last_mid = int(path_cx)
+
+                error_cmd = apply_sign_logic(error_px, lane_mask, cur_sign, cx)
+
+                angle_cmd = -pid.compute(error_cmd)
+                angle_cmd = max(min(angle_cmd, MAX_ANGLE), -MAX_ANGLE)
+                # ===== GIẢM GÓC RIÊNG KHI XUỐNG CẦU =====
+                if bridge_armed and bridge_state_name == "DOWN":
+                    angle_cmd *= BRIDGE_DOWN_ANGLE_COEFF
+                    angle_cmd = max(min(angle_cmd, BRIDGE_DOWN_MAX_ANGLE), -BRIDGE_DOWN_MAX_ANGLE)
+
+                last_good_angle_cmd = angle_cmd
+                angle_history.append(angle_cmd)
+
+                if cur_sign == 'stop_sign':
+                    speed_cmd = 0
+                else:
+                    speed_cmd = adaptive_speed_control(error_cmd, base_speed=base_speed_eff)
+
+                    # ================== BRIDGE POLICY v2 refined ==================
+                    top_policy_ok  = bridge_armed and bridge2_seen
+                    down_policy_ok = bridge_armed and (bridge2_seen or down_frames >= BRIDGE_DOWN_FALLBACK_FR)
+
+                    if bridge_armed:
+                        if bridge_state_name == "TOP":
+                            if top_policy_ok and top_slow_active:
+                                speed_cmd = int(speed_cmd * BRIDGE_TOP_SLOW_COEFF)
+                            else:
+                                speed_cmd = int(speed_cmd * bridge_speed_coeff)
+
+                        elif bridge_state_name == "DOWN":
+                            if down_policy_ok:
+                                # Stop #1 mid-slope
+                                if (not down_stop1_done) and (down_frames >= BRIDGE_DOWN_STOP1_AT_FR):
+                                    down_stop_frames_left = BRIDGE_DOWN_STOP_HOLD_FR
+                                    down_stop1_done = True
+                                    print("[BRIDGE-DOWN] Stop #1 (mid-slope)")
+
+                                # Stop #2 near-end
+                                if (not down_stop2_done) and \
+                                   (down_frames >= BRIDGE_DOWN_MIN_FR_BEFORE_END) and \
+                                   (abs(pitch_filtered) <= BRIDGE_DOWN_END_PITCH_DEG):
+                                    down_stop_frames_left = BRIDGE_DOWN_STOP_HOLD_FR
+                                    down_stop2_done = True
+                                    print("[BRIDGE-DOWN] Stop #2 (near-end)")
+
+                                if down_stop_frames_left > 0:
+                                    down_stop_frames_left -= 1
+                                    speed_cmd = 0
+                                else:
+                                    speed_cmd = int(speed_cmd * BRIDGE_DOWN_SLOW_COEFF)
+                            else:
+                                speed_cmd = int(speed_cmd * bridge_speed_coeff)
+
+                        elif bridge_state_name == "UP":
+                            speed_cmd = int(speed_cmd * bridge_speed_coeff)
+                        else:
+                            speed_cmd = int(speed_cmd * bridge_speed_coeff)
+                    else:
+                        speed_cmd = int(speed_cmd * bridge_speed_coeff)
+
+                    if speed_cmd < 0:
+                        speed_cmd = 0
+
+                print(
+                    f"[CMD-FWD] sign={cur_sign}, error_px={error_px:.1f}, error_cmd={error_cmd:.1f}, "
+                    f"curv={curvature:.1f}, speed={speed_cmd}, angle={angle_cmd:.1f}, "
+                    f"bridge_state={bridge_state_name}, mid={int(bridge2_seen)}, down_frames={down_frames}"
+                )
+
+                control(speed_cmd, angle_cmd)
+
+            else:
+                lost_frames += 1
+                print(f"[LOST] lane not found, lost_frames={lost_frames}, mode={mode}")
+
+                if mode == MODE_FORWARD:
+                    if lost_frames == 1:
+                        control(0, 0)
+                    elif lost_frames >= RECOV_LOST_FRAMES_TRIGGER:
+                        if len(angle_history) > 0:
+                            base_turn_angle = max(angle_history, key=lambda a: abs(a))
+                        else:
+                            base_turn_angle = last_good_angle_cmd
+
+                        base_turn_angle = max(min(base_turn_angle, MAX_ANGLE), -MAX_ANGLE)
+                        mode = MODE_RECOV_BACK
+                        recover_angle = -base_turn_angle
+                        print(f"[RECOV-START-BACK] base_turn_angle={base_turn_angle:.1f}")
+                        control(RECOV_REVERSE_SPEED, recover_angle)
+                else:
+                    recover_angle = -base_turn_angle
+                    control(RECOV_REVERSE_SPEED, recover_angle)
+
+            # === FPS & RECORD VIDEO ===
+            t1 = time.perf_counter()
+            fps = 1.0 / max(t1 - t0, 1e-6)
+            fps_hist.append(fps)
+            frame_count += 1
+            avg_fps = sum(fps_hist) / len(fps_hist)
+
+            if isinstance(masks, np.ndarray) and isinstance(boxes, np.ndarray) and boxes.size > 0:
+                _, vis_img = vis_result(
+                    img3, (boxes, masks, (H, W)),
+                    colorlist, CLASSES, onScreen=True
+                )
+            else:
+                vis_small = cv2.resize(frame, (INPUT_W, INPUT_H))
+                vis_img = np.concatenate([vis_small, vis_small, vis_small], axis=1)
+
+            cv2.putText(
+                vis_img,
+                f'FPS:{avg_fps:.1f} sign:{cur_sign} lost:{lost_frames} '
+                f'mode:{mode} speed:{speed_cmd} angle:{angle_cmd:.1f}',
+                (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+            cv2.putText(
+                vis_img,
+                f'pitch:{pitch_filtered:.1f} state:{bridge_state_name} '
+                f'mid:{int(bridge2_seen)} topSlow:{int(top_slow_active)} '
+                f'downFr:{down_frames} stopLeft:{down_stop_frames_left}',
+                (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA
+            )
+
+            if writer is not None:
+                writer.write(vis_img)
+
+    except KeyboardInterrupt:
+        print('Dừng bởi người dùng.')
+    finally:
+        print("[FINAL] Gửi (0,0) và đóng tài nguyên.")
+        control(0, 0)
+        cap.release()
+        rknn.release()
+        if writer is not None:
+            writer.release()
+            print('Đã lưu video tại:', video_path)
+        close_serial()
+        cv2.destroyAllWindows()
+
+
+if __name__ == '__main__':
+    main()
+

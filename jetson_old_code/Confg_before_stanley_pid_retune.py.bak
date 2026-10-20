@@ -1,0 +1,289 @@
+"""
+Confg.py — Cấu hình tập trung cho hệ thống AGV Patrol Robot
+============================================================
+Tất cả các file Python khác sẽ import từ file này:
+    from Confg import *
+
+Khi cần đổi 1 thông số → CHỈ sửa ở đây, không sửa các file khác.
+
+Tổ chức theo 7 nhóm:
+  1. NETWORK    — socket xe + MQTT
+  2. TELEGRAM   — bot token, chat id
+  3. CAMERA     — kích thước, FPS
+  4. MODEL      — đường dẫn AI models
+  5. VISION     — ngưỡng detection
+  6. CONTROL    — PID, tốc độ, steering
+  7. NAVIGATION — patrol locations, ArUco, intersection
+  8. ALERT      — cooldown, lưu ảnh
+============================================================
+"""
+
+# ============================================================
+#  1. NETWORK — Socket xe (Jetson ↔ simulator/STM32) + MQTT
+# ============================================================
+
+# Socket xe (Python ↔ STM32 hoặc fake_car_socket)
+SOCKET_IP   = "127.0.0.1"
+SOCKET_PORT = 54321
+
+# MQTT broker (server.py chạy trên PC)
+MQTT_BROKER_IP    = "172.20.10.6"   # IP máy chủ chạy Mosquitto (laptop, mang hotspot - co the doi neu doi mang/IP DHCP)
+MQTT_PORT         = 1883
+MQTT_TOPIC_ALERT  = "patrol/alert"     # khi phát hiện xâm nhập
+MQTT_TOPIC_STATUS = "patrol/status"    # heartbeat mỗi 10 giây
+MQTT_CLIENT_ID    = "jetson_patrol_01"
+
+
+# ============================================================
+#  2. TELEGRAM — Bot thông báo cảnh báo
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # lấy từ @BotFather
+TELEGRAM_CHAT_ID   = "YOUR_CHAT_ID_HERE"     # ID nhóm bảo vệ (số âm)
+
+
+# ============================================================
+#  3. CAMERA
+# ============================================================
+
+CAMERA_INDEX  = 0       # 0 = C270 mặc định
+CAMERA_WIDTH  = 640
+CAMERA_HEIGHT = 360
+CAMERA_FPS    = 30
+
+
+# ============================================================
+#  4. MODEL PATHS — đường dẫn các file model AI
+# ============================================================
+
+SEGMENTATION_MODEL_PATH = "/mnt/ssd/agv_models/segmentation_mobilenetv2.tar"
+SIGN_MODEL_PATH         = "/mnt/big/detectsign.pt"
+PERSON_MODEL_PATH       = "yolov8n.pt"   # Jetson compatible YOLOv8n
+PERSON_INFERENCE_SIZE = 320    # Toi uu YOLO Jetson Nano
+
+# Tham số model
+SEG_INPUT_SIZE = (256, 448)    # Toi uu Jetson Nano
+SEG_NORMALIZE_MEAN = [0.485, 0.456, 0.406]
+SEG_NORMALIZE_STD  = [0.229, 0.224, 0.225]
+
+
+# ============================================================
+#  5. VISION — Ngưỡng detection
+# ============================================================
+
+# --- Person detection (YOLO) ---
+PERSON_CONF_THRESHOLD = 0.55    # ngưỡng confidence (0-1)
+PERSON_MIN_AREA       = 1500    # diện tích bbox tối thiểu (pixel²)
+PERSON_CONFIRM_FRAMES = 8       # số frame liên tiếp để xác nhận
+PERSON_CONFIRM_RATIO  = 0.75    # tỉ lệ frame phải detect được
+
+# --- Toi uu toc do xu ly (giam do tre vong dieu khien lai) ---
+# YOLO dang chay CPU (torchvision NMS CUDA khong san co tren Jetson nay),
+# nen cho no chay it khung hon thay vi moi khung, chay song song thread
+# rieng voi segmentation (GPU) de khong cong don do tre.
+YOLO_EVERY_N_FRAMES = 3   # chi chay YOLO person-detect 1/3 khung hinh
+PERSON_CLASS_ID       = 0       # class ID 0 = person trong COCO
+VEHICLE_CLASS_ID      = 2       # class ID 2 = car trong COCO
+
+# --- Segmentation (DeepLabV3) ---
+SEG_NUM_CLASSES = 6
+SEG_BACKBONE    = "mobilenetv2"
+# Thu tu PHAI khop dung luc train (xem train_segmentation.py: CLASS_NAMES)
+SEG_CLASS_NAMES = ["background", "road", "line", "car", "motobike", "person"]
+CLASS_COLORS    = {
+    0: [0, 0, 0],        # background
+    1: [128, 0, 128],    # road - tim
+    2: [0, 255, 255],    # line - xanh ngoc
+    3: [0, 255, 0],      # car - xanh la
+    4: [255, 165, 0],    # motobike - cam
+    5: [255, 0, 0],      # person - do
+}
+
+
+# ============================================================
+#  6. CONTROL — Điều khiển xe
+# ============================================================
+
+# --- Tốc độ ---
+BASE_SPEED = 90    # tốc độ mặc định trên thẳng
+MIN_SPEED  = 70    # tốc độ tối thiểu khi cua
+
+# --- Steering ---
+MAX_STEER  = 20    # góc lái tối đa (độ)
+STEER_CENTER_X = 320   # tâm khung hình (640/2)
+STEER_TRIM = -1   # bu lech co khi trai/phai, cong vao steer truoc khi gui. Am = xe tu lech PHAI -> bu trai. Duong = xe tu lech TRAI -> bu phai. Tune tung buoc +-1/+-2.
+
+# --- Che do phuc hoi khi lech qua nhieu khoi tam lane ---
+# Firmware KHONG ho tro lui (moi lenh luon FORWARD, target min=0), nen
+# "xoay tai cho" thuc te la xoay quanh 1 banh (banh kia ve 0) o toc do thap,
+# khong phai pivot 2 chieu quanh tam xe.
+RECOVERY_ERROR_THRESHOLD = 150   # |lane_error| px vuot nguong nay -> vao che do phuc hoi
+RECOVERY_SPEED           = 16    # toc do rat thap luc phuc hoi (<=20 nen Bridge KHONG clamp len 20)
+
+# 2026-09-04: neu mat dau lane (lane_points=None) qua nhieu khung lien tiep,
+# dung lai an toan thay vi cu lai theo last_midpoint cu (da thay that: xe
+# di lac vao "Khu B - Bai xe", Lane count:0, camera nhin vao cay/tuong ma
+# van cu chay theo gia tri lane cu).
+LANE_LOST_MAX_FRAMES = 8    # so khung lien tiep khong thay lane truoc khi dung
+LANE_LOST_SPEED      = 0    # toc do khi da mat dau qua lau (0 = dung han)
+
+# --- PID lane following ---
+PID_KP = 0.16
+PID_KI = 0.001
+PID_KD = 0.05
+PID_MAX_OUTPUT  = 20
+PID_INTEGRAL_LIMIT = 8      # anti-windup
+PID_STEP_LIMIT  = 16        # max delta giữa 2 lần compute
+
+# --- Loc mem lane_error (giam rung giat do nhieu segmentation frame-to-frame) ---
+# EMA: smoothed = ALPHA*moi + (1-ALPHA)*cu. ALPHA=1.0 -> khong loc (nhu cu).
+# ALPHA cang nho -> cang muot nhung cang tre phan ung. Tune tung buoc +-0.1.
+LANE_ERROR_SMOOTHING_ALPHA = 0.5
+
+# --- Adaptive speed ---
+ADAPTIVE_ERROR_NORM      = 280     # chuẩn hóa error → factor
+ADAPTIVE_POWER           = 1.8     # mũ giảm tốc theo error
+ADAPTIVE_HEAVY_THRESHOLD = 140     # error > 140 → giảm tốc thêm 0.8x
+ADAPTIVE_SEVERE_THRESHOLD = 180    # error > 180 → giảm tốc thêm 0.7x
+
+# --- Slope detection ---
+SLOPE_BOOST_LIGHT      = 1.10   # error > 50
+SLOPE_BOOST_MEDIUM     = 1.15   # error > 100
+SLOPE_BOOST_HEAVY      = 1.20   # khi lane points thay đổi nhiều
+
+
+# ============================================================
+#  7. NAVIGATION — Tuần tra, ArUco, giao lộ
+# ============================================================
+
+# --- Vị trí tuần tra ---
+PATROL_LOCATIONS = [
+    "Cong chinh",
+    "Khu A - Hanh lang",
+    "Khu B - Bai xe",
+    "Khu C - San sau",
+]
+LOCATION_INTERVAL = 60   # giây — đổi vị trí mỗi 60s
+
+# --- ArUco markers ---
+ARUCO_DICT_NAME      = "DICT_4X4_50"     # tên dict trong cv2.aruco
+ARUCO_MIN_AREA       = 800                # pixel² — bỏ marker quá nhỏ
+ARUCO_CONFIRM_FRAMES = 5                  # số frame liên tiếp để nhận lệnh
+
+# Marker generation (cho generate_markers.py)
+ARUCO_MARKER_SIZE  = 600     # pixel — kích thước ảnh marker
+ARUCO_BORDER_SIZE  = 80      # pixel — viền trắng xung quanh
+ARUCO_OUTPUT_DIR   = "./markers"
+
+# Ánh xạ marker ID → lệnh
+ARUCO_COMMANDS = {
+    0: "turn_left",    # marker ID 0 → rẽ trái
+    1: "turn_right",   # marker ID 1 → rẽ phải
+    2: "straight",     # marker ID 2 → đi thẳng
+    3: "stop",         # marker ID 3 → dừng lại
+}
+
+# Hiển thị nhãn marker khi in ra
+ARUCO_MARKER_INFO = {
+    0: {"cmd": "RE TRAI",  "color": (220, 100, 50),  "symbol": "<-"},
+    1: {"cmd": "RE PHAI",  "color": (50,  100, 220), "symbol": "->"},
+    2: {"cmd": "DI THANG", "color": (50,  180, 50),  "symbol": "^"},
+    3: {"cmd": "DUNG LAI", "color": (50,  50,  220), "symbol": "[]"},
+}
+
+# --- Logic dừng khi gặp marker STOP ---
+STOP_DURATION = 3.0   # giây dừng khi gặp marker STOP
+
+# --- Intersection detection ---
+INTERSECTION_SCAN_Y           = 270   # đường scan để detect lane center
+INTERSECTION_DISPLAY_SCAN_Y   = 360   # đường scan để vẽ display
+INTERSECTION_SHIFT_THRESHOLD  = 80    # pixel — ngưỡng dịch chuyển detect rẽ
+
+# --- Line scan band (2026-09-04) ---
+# Vach ke duong la net dut: neu chi quet dung 1 hang y, co luc rot vao
+# khoang trong giua 2 net dut -> mat tin hieu line, fallback ve road
+# (khong nhay theo lech that cua xe) -> troi tich luy roi moi keo gap.
+# Quet them +-LINE_SCAN_BAND hang quanh y, uu tien hang GAN y nhat co
+# vach, de "nhin" qua khoang trong ma van bam theo vach lien tuc.
+LINE_SCAN_BAND = 35    # pixel, +- quanh hang scan chinh
+
+# --- Heading error (2026-09-04) ---
+# Quet them 1 hang o xa hon (Y nho hon = xa hon trong anh), noi voi diem
+# gan (INTERSECTION_SCAN_Y) thanh 1 duong thang, lay GOC lech cua duong
+# do lam tin hieu bo sung cho lane_error (chi lech ngang tai 1 hang).
+# Cong THEM vao lane_error hien co (khong thay the) - neu 1 trong 2 diem
+# khong thay thi bo qua, dung nguyen lane_error cu nhu truoc gio.
+HEADING_SCAN_Y_FAR    = 180   # hang quet "xa" (Y nho hon INTERSECTION_SCAN_Y)
+HEADING_ERROR_WEIGHT  = 2.0   # so pixel-tuong-duong cho moi 1 do lech goc
+INTERSECTION_STABLE_FRAMES    = 3     # số frame ổn định để kích hoạt
+INTERSECTION_MAX_FRAMES       = 25    # frame tối đa ở chế độ intersection
+INTERSECTION_TIMEOUT_FRAMES   = 40    # frame timeout reset sign
+
+# Khoảng cách an toàn sau khi đi qua marker
+SAFE_DIST_FRAMES_AFTER_SIGN = 5
+
+# Lane post-intersection stability
+LANE_STABLE_OFFSET = 40   # |midpoint - center_x| < 40 → coi như đã thẳng
+LANE_STABLE_WIDTH  = 70   # right - left > 70 → lane đủ rộng
+
+# Stability filter (chống nhiễu giao lộ)
+STABILITY_REQUIRED_FRAMES    = 3
+STABILITY_CONFIDENCE_THR     = 0.6
+STABILITY_AGREEMENT_RATIO    = 0.7
+
+
+# ============================================================
+#  8. ALERT & LOGGING
+# ============================================================
+
+ALERT_COOLDOWN_SEC = 30                     # giây chờ giữa 2 lần alert
+SAVE_ALERT_IMAGE   = True
+ALERT_IMAGE_DIR    = "./alert_images"
+STATUS_INTERVAL_SEC = 10                    # gửi heartbeat mỗi 10s
+
+# --- Server side (Sever.py) ---
+ALERT_SERVER_SAVE_DIR = "./server_alerts"
+PATROL_DB_PATH        = "./patrol_log.db"
+
+
+# ============================================================
+#  9. DEBUG
+# ============================================================
+
+SHOW_DEBUG_WINDOW = False    # Headless test qua SSH
+DEBUG_HUD_FONT_SCALE = 0.52
+DEBUG_HUD_LINE_HEIGHT = 21
+
+
+# ============================================================
+#  10. LIDAR (chưa dùng — để dành cho v2)
+# ============================================================
+
+# Đơn vị: mét
+LIDAR_STOP_DIST_M           = 1.20
+LIDAR_RESUME_DIST_M         = 1.60
+LIDAR_MAX_VALID_DIST_M      = 12.0
+LIDAR_STOP_CONFIRM_FRAMES   = 3
+LIDAR_CLEAR_CONFIRM_FRAMES  = 8
+
+
+# ============================================================
+#  HELPER — Tạo các giá trị dẫn xuất (không sửa)
+# ============================================================
+import os
+import cv2
+
+# Lấy ArUco dict object từ tên string
+def _get_aruco_dict():
+    return cv2.aruco.getPredefinedDictionary(
+        getattr(cv2.aruco, ARUCO_DICT_NAME)
+    )
+
+# Đảm bảo các thư mục tồn tại
+def _ensure_dirs():
+    os.makedirs(ALERT_IMAGE_DIR, exist_ok=True)
+    os.makedirs(ARUCO_OUTPUT_DIR, exist_ok=True)
+    os.makedirs(ALERT_SERVER_SAVE_DIR, exist_ok=True)
+
+# Auto-call khi import
+_ensure_dirs()

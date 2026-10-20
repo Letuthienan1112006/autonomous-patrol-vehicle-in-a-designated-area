@@ -1,0 +1,70 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models.segmentation.deeplabv3 import DeepLabHead
+from torchvision import models
+from torchvision.models._utils import IntermediateLayerGetter
+
+
+class DeepLabV3(nn.Module):
+    def __init__(self, num_classes=2, backbone='resnet50', pretrained=True, output_stride=8):
+        super(DeepLabV3, self).__init__()
+
+        # --------- chọn backbone ----------
+        if backbone == 'resnet50':
+            weights = models.ResNet50_Weights.DEFAULT if pretrained else None
+            base_model = models.resnet50(weights=weights)
+            return_layers = {'layer4': 'out'}
+            in_channels = 2048
+
+        elif backbone == 'resnet101':
+            weights = models.ResNet101_Weights.DEFAULT if pretrained else None
+            base_model = models.resnet101(weights=weights)
+            return_layers = {'layer4': 'out'}
+            in_channels = 2048
+
+        elif backbone == 'mobilenetv2':
+            weights = models.MobileNet_V2_Weights.DEFAULT if pretrained else None
+            base_model = models.mobilenet_v2(weights=weights).features
+            return_layers = {'18': 'out'}
+            in_channels = 320
+
+        else:
+            raise ValueError(f"Backbone '{backbone}' không được hỗ trợ. Hãy dùng 'resnet50', 'resnet101' hoặc 'mobilenetv2'.")
+
+        # --------- trích xuất đặc trưng ----------
+        self.backbone = IntermediateLayerGetter(base_model, return_layers)
+        self.classifier = DeepLabHead(in_channels, num_classes)
+
+    def forward(self, x):
+        input_shape = x.shape[-2:]
+        features = self.backbone(x)
+        x = self.classifier(features["out"])
+        x = F.interpolate(x, size=input_shape, mode='bilinear', align_corners=False)
+        return x
+
+
+def create_deeplabv3(num_classes=2, backbone='resnet50', pretrained=True, output_stride=8):
+    """Tạo mô hình DeepLabV3 với backbone và số lớp tùy chỉnh."""
+    model = DeepLabV3(
+        num_classes=num_classes,
+        backbone=backbone,
+        pretrained=pretrained,
+        output_stride=output_stride,
+    )
+    return model
+
+
+def test():
+    """Kiểm thử nhanh mô hình DeepLabV3."""
+    x = torch.randn((2, 3, 360, 640))
+    model = create_deeplabv3(num_classes=2)
+    preds = model(x)
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {preds.shape}")
+    assert preds.shape == (2, 2, 360, 640), f"Expected (2, 2, 360, 640), got {preds.shape}"
+    print("✅ Test passed! Mô hình hoạt động ổn định.")
+
+
+if __name__ == "__main__":
+    test()
